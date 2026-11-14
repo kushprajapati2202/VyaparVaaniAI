@@ -167,7 +167,7 @@ class Order(Base):
     created_at = Column(DateTime, default=get_utc_now)
 
     organization = relationship("Organization", back_populates="orders")
-    customer = relationship("Customer", back_populates="orders")
+    customer = relationship("Customer", back_populates="orders", lazy="selectin")
     items = relationship("OrderItem", back_populates="order", cascade="all, delete-orphan", lazy="selectin")
     delivery_task = relationship("DeliveryTask", back_populates="order", uselist=False, cascade="all, delete-orphan", lazy="selectin")
     approvals = relationship("Approval", back_populates="order", cascade="all, delete-orphan", lazy="selectin")
@@ -183,7 +183,7 @@ class OrderItem(Base):
     subtotal = Column(Float, nullable=False)
 
     order = relationship("Order", back_populates="items")
-    product = relationship("Product", back_populates="order_items")
+    product = relationship("Product", back_populates="order_items", lazy="selectin")
 
 class LedgerEntry(Base):
     __tablename__ = "ledger_entries"
