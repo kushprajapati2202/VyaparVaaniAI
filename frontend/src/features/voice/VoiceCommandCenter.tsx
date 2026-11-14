@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { 
   Mic, MicOff, Volume2, Sparkles, AlertTriangle, CheckCircle2, 
   Send, Zap, ChevronRight, Receipt, User, Clock, ShieldAlert,
-  ArrowUpRight, CornerDownLeft, VolumeX
+  ArrowUpRight, CornerDownLeft, VolumeX, ListChecks, Smartphone
 } from 'lucide-react';
 import { VoiceMessage } from '../../types';
 
@@ -22,6 +22,7 @@ interface DraftBillItem {
 export const VoiceCommandCenter: React.FC<VoiceCommandCenterProps> = ({ currentLanguage, onRefreshData }) => {
   const [isRecording, setIsRecording] = useState(false);
   const [isConnected, setIsConnected] = useState(false);
+  const [mobileTab, setMobileTab] = useState<'mic' | 'bill'>('mic');
   const [messages, setMessages] = useState<VoiceMessage[]>([
     {
       id: 'init-1',
@@ -93,7 +94,6 @@ export const VoiceCommandCenter: React.FC<VoiceCommandCenterProps> = ({ currentL
 
       // Update draft bill state based on agent dialog
       if (data.text.includes('ચોખાનો જથ્થો') && draftBill) {
-        // Updated after correction
         const updated = { ...draftBill };
         if (updated.items.length > 0) {
           updated.items[0].quantity = 15;
@@ -176,7 +176,6 @@ export const VoiceCommandCenter: React.FC<VoiceCommandCenterProps> = ({ currentL
   const sendUtterance = (text: string) => {
     if (!text.trim()) return;
 
-    // Build visual parchi preview instantly to give incredible tactile feedback
     const lower = text.toLowerCase();
     if (lower.includes('rahul') || text.includes('રાહુલ')) {
       const isCorrected = lower.includes('15') || lower.includes('change');
@@ -231,7 +230,7 @@ export const VoiceCommandCenter: React.FC<VoiceCommandCenterProps> = ({ currentL
       {
         id: Math.random().toString(),
         role: 'system',
-        text: '🛑 Barge-in: Output audio buffer cleared. Agent listening for correction...',
+        text: '🛑 Barge-in: Output buffer cleared. Agent listening for correction...',
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
       }
     ]);
@@ -254,16 +253,16 @@ export const VoiceCommandCenter: React.FC<VoiceCommandCenterProps> = ({ currentL
     },
     {
       title: 'Workflow 3: Confirm & Persist',
-      category: 'Order Confirmation',
+      category: 'Execution',
       text: 'હા, બરાબર છે, કન્ફર્મ કરી દો.',
-      badge: 'Execution',
+      badge: 'Execute',
       tagColor: 'text-emerald-400 border-emerald-500/30 bg-emerald-500/10'
     },
     {
       title: 'Workflow 4: Credit Limit & Approval',
       category: 'Guardrails',
       text: 'Give Amit 50 kg rice on credit.',
-      badge: 'Human Approval',
+      badge: 'Approval',
       tagColor: 'text-rose-400 border-rose-500/30 bg-rose-500/10'
     },
     {
@@ -276,34 +275,34 @@ export const VoiceCommandCenter: React.FC<VoiceCommandCenterProps> = ({ currentL
   ];
 
   return (
-    <div className="max-w-[1400px] mx-auto p-4 sm:p-6 space-y-6">
+    <div className="max-w-[1400px] mx-auto p-3 sm:p-6 space-y-4 sm:space-y-6">
       
       {/* Top Banner: Stage Status & Quick Actions */}
-      <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 bg-surface border border-border rounded-2xl p-4 sm:px-6">
+      <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 bg-surface border border-border rounded-2xl p-4">
         <div className="flex items-center gap-3">
-          <div className="w-9 h-9 rounded-xl bg-saffron-500/15 border border-saffron-500/30 flex items-center justify-center text-saffron-400 font-bold">
+          <div className="w-9 h-9 rounded-xl bg-saffron-500/15 border border-saffron-500/30 flex items-center justify-center text-saffron-400 font-bold shrink-0">
             <Mic className="w-5 h-5" />
           </div>
           <div>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 flex-wrap">
               <h1 className="text-sm font-bold text-white tracking-tight">Vernacular Voice Counter</h1>
               <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-border">
                 {workflowStage === 'IDLE' ? 'Counter Ready' : `Workflow: ${workflowStage}`}
               </span>
             </div>
-            <p className="text-xs text-slate-400">Speak naturally in Gujarati, Hindi, or Hinglish — no manual typing required</p>
+            <p className="text-xs text-slate-400 line-clamp-1">Speak in Gujarati, Hindi, or Hinglish — zero typing</p>
           </div>
         </div>
 
-        {/* Status Pills */}
-        <div className="flex items-center gap-2 shrink-0">
-          <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-background border border-border text-xs text-slate-300">
-            <span className={`w-2 h-2 rounded-full ${isConnected ? 'bg-emerald-400 animate-pulse' : 'bg-rose-400'}`} />
-            <span>{isConnected ? '16kHz Audio Stream' : 'Offline'}</span>
+        {/* Status & Barge-in Controls */}
+        <div className="flex items-center gap-2 self-stretch sm:self-auto justify-between sm:justify-end shrink-0">
+          <div className="flex items-center gap-2 px-2.5 py-1.5 rounded-xl bg-background border border-border text-xs text-slate-300">
+            <span className={`w-2 h-2 rounded-full shrink-0 ${isConnected ? 'bg-emerald-400 animate-pulse' : 'bg-rose-400'}`} />
+            <span className="text-[11px] font-mono">{isConnected ? '16kHz PCM' : 'Offline'}</span>
           </div>
           <button
             onClick={triggerInterruption}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 text-amber-300 text-xs font-semibold transition-all"
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 text-amber-300 text-xs font-semibold transition-all active:scale-95"
             title="Interrupt speaking agent and clear audio buffer"
           >
             <Zap className="w-3.5 h-3.5 text-amber-400" />
@@ -312,22 +311,51 @@ export const VoiceCommandCenter: React.FC<VoiceCommandCenterProps> = ({ currentL
         </div>
       </div>
 
+      {/* Mobile Tab Switcher: Only visible on screens < lg */}
+      <div className="lg:hidden flex items-center bg-card p-1 rounded-2xl border border-border">
+        <button
+          onClick={() => setMobileTab('mic')}
+          className={`flex-1 flex items-center justify-center gap-2 py-2 rounded-xl text-xs font-bold transition-all ${
+            mobileTab === 'mic'
+              ? 'bg-saffron-500 text-slate-950 shadow-sm'
+              : 'text-slate-400 hover:text-white'
+          }`}
+        >
+          <Mic className="w-4 h-4" />
+          <span>Voice Deck & Scenarios</span>
+        </button>
+        <button
+          onClick={() => setMobileTab('bill')}
+          className={`flex-1 flex items-center justify-center gap-2 py-2 rounded-xl text-xs font-bold transition-all ${
+            mobileTab === 'bill'
+              ? 'bg-saffron-500 text-slate-950 shadow-sm'
+              : 'text-slate-400 hover:text-white'
+          }`}
+        >
+          <Receipt className="w-4 h-4" />
+          <span>Digital Slip {draftBill ? `(₹${draftBill.totalAmount})` : ''}</span>
+          {draftBill && (
+            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
+          )}
+        </button>
+      </div>
+
       {/* Main Grid: Left Assistant Deck + Right Live Parchi/Bill */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
         
         {/* LEFT COLUMN: Microphone, Quick Prompt Cards, Conversation Stream (7 cols) */}
-        <div className="lg:col-span-7 space-y-6">
+        <div className={`lg:col-span-7 space-y-5 ${mobileTab === 'bill' ? 'hidden lg:block' : 'block'}`}>
           
           {/* Tactile Microphone & Waveform Bar */}
-          <div className="bg-gradient-to-b from-surface to-card border border-border rounded-3xl p-6 shadow-card relative overflow-hidden">
+          <div className="bg-gradient-to-b from-surface to-card border border-border rounded-3xl p-5 sm:p-6 shadow-card relative overflow-hidden">
             
             {/* Ambient Background Glow */}
             <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-72 h-72 bg-saffron-500/5 rounded-full blur-3xl pointer-events-none" />
 
-            <div className="flex flex-col items-center justify-center py-4 relative z-10">
+            <div className="flex flex-col items-center justify-center py-3 relative z-10">
               
               {/* Mic Button with Multi-Ring Ripple */}
-              <div className="relative mb-5">
+              <div className="relative mb-4">
                 {isRecording && (
                   <>
                     <div className="absolute inset-0 rounded-full bg-saffron-500/20 voice-ripple" />
@@ -336,41 +364,41 @@ export const VoiceCommandCenter: React.FC<VoiceCommandCenterProps> = ({ currentL
                 )}
                 <button
                   onClick={toggleRecording}
-                  className={`w-24 h-24 rounded-full flex flex-col items-center justify-center transition-all duration-300 shadow-2xl relative z-10 ${
+                  className={`w-20 h-20 sm:w-24 sm:h-24 rounded-full flex flex-col items-center justify-center transition-all duration-300 shadow-2xl relative z-10 ${
                     isRecording
                       ? 'bg-gradient-to-tr from-rose-600 to-rose-500 text-white shadow-rose-500/40 scale-105'
                       : 'bg-gradient-to-tr from-saffron-500 to-amber-500 text-slate-950 shadow-glow-saffron hover:scale-105 active:scale-95'
                   }`}
                 >
                   {isRecording ? (
-                    <MicOff className="w-9 h-9" />
+                    <MicOff className="w-8 h-8 sm:w-9 sm:h-9" />
                   ) : (
-                    <Mic className="w-9 h-9" />
+                    <Mic className="w-8 h-8 sm:w-9 sm:h-9" />
                   )}
-                  <span className="text-[10px] font-bold mt-1 tracking-tight">
+                  <span className="text-[9px] sm:text-[10px] font-bold mt-1 tracking-tight">
                     {isRecording ? 'TAP TO STOP' : 'TAP & SPEAK'}
                   </span>
                 </button>
               </div>
 
               {/* Dynamic Subtitle */}
-              <p className="text-xs font-semibold text-slate-200">
+              <p className="text-xs font-semibold text-slate-200 text-center">
                 {isRecording ? (
-                  <span className="text-saffron-400 font-bold flex items-center gap-2">
+                  <span className="text-saffron-400 font-bold flex items-center justify-center gap-2">
                     <span className="w-2 h-2 rounded-full bg-saffron-400 animate-ping" />
-                    Listening in real-time...
+                    Listening in real-time... Speak naturally
                   </span>
                 ) : (
-                  'Speak an order, payment receipt, or sales query'
+                  'Speak an order, payment receipt, or query in Gujarati/Hindi'
                 )}
               </p>
 
               {/* Responsive Audio Waveform Visualizer */}
-              <div className="flex items-center gap-1 mt-4 h-8">
+              <div className="flex items-center gap-1 mt-3.5 h-8 max-w-full overflow-hidden px-2">
                 {[...Array(24)].map((_, i) => (
                   <div
                     key={i}
-                    className="w-1 bg-saffron-400 rounded-full transition-all duration-150"
+                    className="w-1 bg-saffron-400 rounded-full transition-all duration-150 shrink-0"
                     style={{
                       height: isRecording 
                         ? `${Math.max(4, Math.sin(i * 0.4 + audioLevel * 6) * 26 + 12)}px`
@@ -391,11 +419,11 @@ export const VoiceCommandCenter: React.FC<VoiceCommandCenterProps> = ({ currentL
                 onChange={(e) => setInputUtterance(e.target.value)}
                 onKeyDown={(e) => e.key === 'Enter' && sendUtterance(inputUtterance)}
                 placeholder="Or type voice text: 'રાહુલને 10 કિલો ચોખા આપો'..."
-                className="flex-1 bg-background/80 border border-border rounded-xl px-4 py-2.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-saffron-500 transition-colors"
+                className="flex-1 bg-background/80 border border-border rounded-xl px-3 sm:px-4 py-2.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-saffron-500 transition-colors"
               />
               <button
                 onClick={() => sendUtterance(inputUtterance)}
-                className="px-4 py-2.5 rounded-xl bg-saffron-500 hover:bg-saffron-600 text-slate-950 font-bold text-xs flex items-center gap-1.5 transition-colors shadow-sm"
+                className="px-3.5 sm:px-4 py-2.5 rounded-xl bg-saffron-500 hover:bg-saffron-600 text-slate-950 font-bold text-xs flex items-center gap-1.5 transition-colors shadow-sm shrink-0"
               >
                 <span>Send</span>
                 <Send className="w-3.5 h-3.5" />
@@ -410,14 +438,17 @@ export const VoiceCommandCenter: React.FC<VoiceCommandCenterProps> = ({ currentL
                 <Sparkles className="w-3.5 h-3.5 text-saffron-400" />
                 <span>Simulate Spoken Scenarios</span>
               </span>
-              <span className="text-[11px] text-slate-500">Click to test live agent</span>
+              <span className="text-[11px] text-slate-500">Tap to run</span>
             </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
               {scenarios.map((sc, i) => (
                 <button
                   key={i}
-                  onClick={() => sendUtterance(sc.text)}
+                  onClick={() => {
+                    sendUtterance(sc.text);
+                    if (window.innerWidth < 1024) setMobileTab('bill');
+                  }}
                   className="text-left p-3 rounded-2xl bg-surface border border-border hover:border-saffron-500/40 hover:bg-card transition-all group relative overflow-hidden"
                 >
                   <div className="flex items-center justify-between mb-1">
@@ -426,7 +457,7 @@ export const VoiceCommandCenter: React.FC<VoiceCommandCenterProps> = ({ currentL
                       {sc.badge}
                     </span>
                   </div>
-                  <p className="text-xs font-semibold text-slate-200 group-hover:text-saffron-300 line-clamp-2 transition-colors">
+                  <p className="text-xs font-semibold text-slate-200 group-hover:text-saffron-300 line-clamp-2 transition-colors break-words">
                     "{sc.text}"
                   </p>
                 </button>
@@ -435,16 +466,16 @@ export const VoiceCommandCenter: React.FC<VoiceCommandCenterProps> = ({ currentL
           </div>
 
           {/* Transcript Feed */}
-          <div className="bg-surface border border-border rounded-2xl p-5 shadow-sm space-y-3">
+          <div className="bg-surface border border-border rounded-2xl p-4 sm:p-5 shadow-sm space-y-3">
             <div className="flex items-center justify-between pb-3 border-b border-border text-xs">
               <span className="font-bold text-white flex items-center gap-2">
                 <Volume2 className="w-4 h-4 text-saffron-400" />
-                <span>Conversation Log</span>
+                <span>Live Dialogue History</span>
               </span>
-              <span className="text-slate-500 text-[11px]">Real-time dialogue</span>
+              <span className="text-slate-500 text-[11px]">Real-time turns</span>
             </div>
 
-            <div className="max-h-64 overflow-y-auto space-y-3 pr-1">
+            <div className="max-h-56 sm:max-h-64 overflow-y-auto space-y-3 pr-1">
               {messages.map((msg) => {
                 const isUser = msg.role === 'user';
                 const isSystem = msg.role === 'system';
@@ -452,7 +483,7 @@ export const VoiceCommandCenter: React.FC<VoiceCommandCenterProps> = ({ currentL
                 if (isSystem) {
                   return (
                     <div key={msg.id} className="text-center py-1">
-                      <span className="inline-block px-3 py-1 rounded-full text-[10px] font-mono bg-background border border-border text-amber-300">
+                      <span className="inline-block px-3 py-1 rounded-full text-[10px] font-mono bg-background border border-border text-amber-300 max-w-full break-words">
                         {msg.text}
                       </span>
                     </div>
@@ -475,7 +506,7 @@ export const VoiceCommandCenter: React.FC<VoiceCommandCenterProps> = ({ currentL
                     </div>
 
                     <div
-                      className={`max-w-[85%] rounded-2xl px-3.5 py-2.5 text-xs leading-relaxed ${
+                      className={`max-w-[85%] rounded-2xl px-3.5 py-2.5 text-xs leading-relaxed break-words ${
                         isUser
                           ? 'bg-saffron-500 text-slate-950 font-medium rounded-tr-none'
                           : 'bg-card border border-border text-slate-200 rounded-tl-none'
@@ -496,10 +527,10 @@ export const VoiceCommandCenter: React.FC<VoiceCommandCenterProps> = ({ currentL
         </div>
 
         {/* RIGHT COLUMN: The Digital Counter Parchi (Bill) (5 cols) */}
-        <div className="lg:col-span-5 space-y-6">
+        <div className={`lg:col-span-5 space-y-6 ${mobileTab === 'mic' ? 'hidden lg:block' : 'block'}`}>
           
           {/* Parchi Card */}
-          <div className="parchi-paper border border-border rounded-3xl p-6 shadow-card space-y-5">
+          <div className="parchi-paper border border-border rounded-3xl p-5 sm:p-6 shadow-card space-y-5">
             
             {/* Parchi Header */}
             <div className="flex items-start justify-between pb-4 border-b border-border/80">
@@ -536,7 +567,7 @@ export const VoiceCommandCenter: React.FC<VoiceCommandCenterProps> = ({ currentL
                     <User className="w-3.5 h-3.5 text-saffron-400" />
                     <span>Customer:</span>
                   </span>
-                  <span className="font-bold text-white">{draftBill.customerName}</span>
+                  <span className="font-bold text-white text-right">{draftBill.customerName}</span>
                 </div>
                 <div className="flex items-center justify-between text-xs">
                   <span className="text-slate-400">Payment Mode:</span>
@@ -615,17 +646,17 @@ export const VoiceCommandCenter: React.FC<VoiceCommandCenterProps> = ({ currentL
                     </div>
                   </div>
                 ) : (
-                  <div className="pt-2 flex items-center gap-2">
+                  <div className="pt-2 flex flex-col sm:flex-row items-center gap-2">
                     <button
                       onClick={() => sendUtterance('હા, કન્ફર્મ કરો')}
-                      className="flex-1 py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-600 text-slate-950 font-bold text-xs flex items-center justify-center gap-1.5 shadow-md shadow-emerald-500/20 transition-all"
+                      className="w-full sm:flex-1 py-3 sm:py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-600 text-slate-950 font-bold text-xs flex items-center justify-center gap-1.5 shadow-md shadow-emerald-500/20 transition-all active:scale-95"
                     >
                       <CheckCircle2 className="w-4 h-4" />
                       <span>Confirm (કન્ફર્મ કરો)</span>
                     </button>
                     <button
                       onClick={() => setDraftBill(null)}
-                      className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold text-xs border border-border transition-colors"
+                      className="w-full sm:w-auto px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold text-xs border border-border transition-colors text-center"
                     >
                       Clear
                     </button>
