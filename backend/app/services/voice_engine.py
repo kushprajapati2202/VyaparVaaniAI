@@ -101,13 +101,28 @@ class VoiceSessionHandler:
             # Parse new quantity
             import re
             numbers = re.findall(r'\d+', text)
-            if numbers:
+            if numbers and self.active_order_draft.get("items"):
                 new_qty = float(numbers[0])
-                if self.active_order_draft.get("items"):
-                    self.active_order_draft["items"][0]["quantity"] = new_qty
-                    correction_msg = f"સમજી ગયો. ચોખાનો જથ્થો {int(new_qty)} કિલો કરી દીધો છે. કન્ફર્મ કરું?"
-                    await self.send_agent_response(correction_msg, "gu-IN")
-                    return
+                # Check if specific item was named
+                target_idx = 0
+                item_name = "ચોખા"
+                if "sugar" in lower_text or "ખાંડ" in text:
+                    for idx, it in enumerate(self.active_order_draft["items"]):
+                        if "Sugar" in it.get("product_name", ""):
+                            target_idx = idx
+                            item_name = "ખાંડ"
+                            break
+                elif "wheat" in lower_text or "ઘઉં" in text:
+                    for idx, it in enumerate(self.active_order_draft["items"]):
+                        if "Wheat" in it.get("product_name", ""):
+                            target_idx = idx
+                            item_name = "ઘઉં"
+                            break
+
+                self.active_order_draft["items"][target_idx]["quantity"] = new_qty
+                correction_msg = f"સમજી ગયો. {item_name}નો જથ્થો {int(new_qty)} કિલો કરી દીધો છે. કન્ફર્મ કરું?"
+                await self.send_agent_response(correction_msg, "gu-IN")
+                return
 
         # 3. Check for Confirmation
         if ("confirm" in lower_text or "કન્ફર્મ" in lower_text or "હા" in lower_text or "yes" in lower_text) and self.active_order_draft:
@@ -199,6 +214,12 @@ class VoiceSessionHandler:
             if cust_name == "Amit Shah" and any(it["quantity"] >= 50.0 for it in items):
                 # Trigger Workflow 4: Policy violation & approval
                 res = await ToolDispatcher.dispatch("create_order_draft", self.active_order_draft, self.db, self.session_id)
+                if not res.get("success"):
+                    err_msg = f"ઓર્ડરમાં ક્ષતિ: {res.get('error')}"
+                    await self.send_agent_response(err_msg, "gu-IN")
+                    self.active_order_draft = None
+                    return
+
                 order_info = res["order"]
                 speech_ans = "અમીતભાઈની ક્રેડિટ મર્યાદા ₹10,000 છે. આ ઓર્ડરથી મર્યાદા વટાવી જાય છે. મેં મંજૂરી માટે રિક્વેસ્ટ મોકલી દીધી છે."
                 await self.websocket.send_json({

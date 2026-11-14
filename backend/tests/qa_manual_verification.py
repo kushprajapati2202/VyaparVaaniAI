@@ -22,6 +22,9 @@ async def run_full_qa():
         print(f"  PASS: Backend healthy ({health_data['app']})")
         report.append(("TC-01", "System Health Check", "PASS", "Status 200, Healthy"))
 
+        # Restock inventory to baseline for clean repeatable testing
+        await client.post(f"{BASE_URL}/inventory/restock")
+
         # TEST 2: Customer Retrieval & Seed Verification
         print("\n[TC-02] Customer Directory & Seed Verification...")
         res = await client.get(f"{BASE_URL}/customers")

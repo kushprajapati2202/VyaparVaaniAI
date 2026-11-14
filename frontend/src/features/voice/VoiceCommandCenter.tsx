@@ -51,15 +51,19 @@ export const VoiceCommandCenter: React.FC<VoiceCommandCenterProps> = ({ currentL
   const socketRef = useRef<WebSocket | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
 
+  const reconnectTimerRef = useRef<any>(null);
+
   useEffect(() => {
     connectWebSocket();
     return () => {
+      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
       if (socketRef.current) socketRef.current.close();
     };
   }, []);
 
   const connectWebSocket = () => {
     try {
+      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
       const ws = new WebSocket('ws://localhost:8000/api/v1/voice/live');
       socketRef.current = ws;
 
@@ -72,10 +76,17 @@ export const VoiceCommandCenter: React.FC<VoiceCommandCenterProps> = ({ currentL
           playAudioBlob(event.data);
         }
       };
-      ws.onclose = () => setIsConnected(false);
-      ws.onerror = () => setIsConnected(false);
+      ws.onclose = () => {
+        setIsConnected(false);
+        // Automatic exponential backoff reconnection for shopkeeper reliability
+        reconnectTimerRef.current = setTimeout(connectWebSocket, 3000);
+      };
+      ws.onerror = () => {
+        setIsConnected(false);
+      };
     } catch (e) {
       console.warn('WebSocket connection error:', e);
+      reconnectTimerRef.current = setTimeout(connectWebSocket, 3000);
     }
   };
 

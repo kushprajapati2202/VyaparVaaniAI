@@ -48,6 +48,9 @@ class LedgerService:
         notes: Optional[str] = None,
         order_id: Optional[str] = None
     ) -> Payment:
+        if amount <= 0:
+            raise ValueError("Payment amount must be greater than zero.")
+
         payment = Payment(
             customer_id=customer_id,
             order_id=order_id,
