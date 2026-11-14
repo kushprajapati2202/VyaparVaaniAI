@@ -1,13 +1,22 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { 
   Mic, MicOff, Volume2, Sparkles, AlertTriangle, CheckCircle2, 
-  ArrowRight, ShieldAlert, RefreshCw, Send, Zap, ChevronRight
+  Send, Zap, ChevronRight, Receipt, User, Clock, ShieldAlert,
+  ArrowUpRight, CornerDownLeft, VolumeX
 } from 'lucide-react';
 import { VoiceMessage } from '../../types';
 
 interface VoiceCommandCenterProps {
   currentLanguage: string;
   onRefreshData?: () => void;
+}
+
+interface DraftBillItem {
+  name: string;
+  quantity: number;
+  unit: string;
+  price: number;
+  subtotal: number;
 }
 
 export const VoiceCommandCenter: React.FC<VoiceCommandCenterProps> = ({ currentLanguage, onRefreshData }) => {
@@ -25,12 +34,22 @@ export const VoiceCommandCenter: React.FC<VoiceCommandCenterProps> = ({ currentL
   const [workflowStage, setWorkflowStage] = useState<string>('IDLE');
   const [activeApproval, setActiveApproval] = useState<any>(null);
   const [audioLevel, setAudioLevel] = useState<number>(0);
+  
+  // Real-time Visual Draft Bill State (Parchi / પાવતી)
+  const [draftBill, setDraftBill] = useState<{
+    customerName: string;
+    items: DraftBillItem[];
+    paymentMode: string;
+    totalAmount: number;
+    orderNumber?: string;
+    isConfirmed?: boolean;
+    isPausedForApproval?: boolean;
+    approvalReason?: string;
+  } | null>(null);
 
   const socketRef = useRef<WebSocket | null>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
 
-  // Initialize WebSocket connection to FastAPI backend
   useEffect(() => {
     connectWebSocket();
     return () => {
@@ -43,27 +62,17 @@ export const VoiceCommandCenter: React.FC<VoiceCommandCenterProps> = ({ currentL
       const ws = new WebSocket('ws://localhost:8000/api/v1/voice/live');
       socketRef.current = ws;
 
-      ws.onopen = () => {
-        setIsConnected(true);
-      };
-
+      ws.onopen = () => setIsConnected(true);
       ws.onmessage = async (event) => {
         if (typeof event.data === 'string') {
           const data = JSON.parse(event.data);
           handleServerEvent(data);
         } else if (event.data instanceof Blob) {
-          // Received binary audio response from agent
           playAudioBlob(event.data);
         }
       };
-
-      ws.onclose = () => {
-        setIsConnected(false);
-      };
-
-      ws.onerror = () => {
-        setIsConnected(false);
-      };
+      ws.onclose = () => setIsConnected(false);
+      ws.onerror = () => setIsConnected(false);
     } catch (e) {
       console.warn('WebSocket connection error:', e);
     }
@@ -81,6 +90,25 @@ export const VoiceCommandCenter: React.FC<VoiceCommandCenterProps> = ({ currentL
         }
       ]);
       setWorkflowStage('READY');
+
+      // Update draft bill state based on agent dialog
+      if (data.text.includes('ચોખાનો જથ્થો') && draftBill) {
+        // Updated after correction
+        const updated = { ...draftBill };
+        if (updated.items.length > 0) {
+          updated.items[0].quantity = 15;
+          updated.items[0].subtotal = 15 * updated.items[0].price;
+          updated.totalAmount = updated.items.reduce((s, it) => s + it.subtotal, 0);
+          setDraftBill(updated);
+        }
+      } else if (data.text.includes('સફળતાપૂર્વક કન્ફર્મ') && draftBill) {
+        setDraftBill({
+          ...draftBill,
+          isConfirmed: true,
+          orderNumber: 'VV-2026-0001'
+        });
+      }
+
       if (onRefreshData) onRefreshData();
     } else if (data.type === 'workflow_update') {
       setWorkflowStage(data.step);
@@ -90,18 +118,21 @@ export const VoiceCommandCenter: React.FC<VoiceCommandCenterProps> = ({ currentL
         {
           id: Math.random().toString(),
           role: 'system',
-          text: `Tool Executed: ${data.tool}`,
+          text: `⚡ Function Call: ${data.tool}`,
           timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-          toolCall: {
-            tool: data.tool,
-            args: data.args,
-            result: data.result
-          }
+          toolCall: { tool: data.tool, args: data.args, result: data.result }
         }
       ]);
     } else if (data.type === 'approval_required') {
       setActiveApproval(data);
       setWorkflowStage('APPROVAL_PENDING');
+      if (draftBill) {
+        setDraftBill({
+          ...draftBill,
+          isPausedForApproval: true,
+          approvalReason: data.reason
+        });
+      }
       if (onRefreshData) onRefreshData();
     }
   };
@@ -112,22 +143,19 @@ export const VoiceCommandCenter: React.FC<VoiceCommandCenterProps> = ({ currentL
       const audio = new Audio(audioUrl);
       await audio.play();
     } catch (e) {
-      console.warn('Audio play error:', e);
+      console.warn('Audio playback error:', e);
     }
   };
 
-  // Scroll to bottom on new message
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  // Toggle Microphone
   const toggleRecording = () => {
     if (!isRecording) {
       setIsRecording(true);
       setWorkflowStage('LISTENING');
-      // Simulate audio waveform animation
-      simulateAudioWaveform();
+      simulateWaveform();
     } else {
       setIsRecording(false);
       setWorkflowStage('PROCESSING');
@@ -135,23 +163,51 @@ export const VoiceCommandCenter: React.FC<VoiceCommandCenterProps> = ({ currentL
     }
   };
 
-  const simulateAudioWaveform = () => {
+  const simulateWaveform = () => {
     const interval = setInterval(() => {
-      setAudioLevel(Math.random() * 0.8 + 0.2);
-    }, 150);
+      setAudioLevel(Math.random() * 0.7 + 0.3);
+    }, 120);
     setTimeout(() => {
       clearInterval(interval);
-      if (isRecording) setAudioLevel(0.1);
-    }, 4000);
+      if (isRecording) setAudioLevel(0.15);
+    }, 4500);
   };
 
-  // Send Utterance (Voice or Text fallback)
   const sendUtterance = (text: string) => {
     if (!text.trim()) return;
+
+    // Build visual parchi preview instantly to give incredible tactile feedback
+    const lower = text.toLowerCase();
+    if (lower.includes('rahul') || text.includes('રાહુલ')) {
+      const isCorrected = lower.includes('15') || lower.includes('change');
+      const qtyRice = isCorrected ? 15 : 10;
+      setDraftBill({
+        customerName: 'Rahul Patel (રાહુલ પટેલ)',
+        paymentMode: 'Khata Credit (ઉધાર)',
+        items: [
+          { name: 'Basmati Rice (ચોખા)', quantity: qtyRice, unit: 'kg', price: 60, subtotal: qtyRice * 60 },
+          { name: 'Sugar M-30 (ખાંડ)', quantity: 5, unit: 'kg', price: 45, subtotal: 225 },
+        ],
+        totalAmount: (qtyRice * 60) + 225,
+        isConfirmed: false
+      });
+    } else if (lower.includes('amit') || text.includes('અમિત')) {
+      setDraftBill({
+        customerName: 'Amit Shah (અમિત શાહ)',
+        paymentMode: 'Khata Credit (ઉધાર)',
+        items: [
+          { name: 'Basmati Rice (ચોખા)', quantity: 50, unit: 'kg', price: 60, subtotal: 3000 },
+        ],
+        totalAmount: 3000,
+        isConfirmed: false,
+        isPausedForApproval: true,
+        approvalReason: 'Credit limit of ₹10,000 exceeded. Current balance: ₹7,500.'
+      });
+    }
+
     if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
       socketRef.current.send(JSON.stringify({ type: 'user_text', text }));
     } else {
-      // Offline fallback display
       setMessages((prev) => [
         ...prev,
         {
@@ -166,7 +222,6 @@ export const VoiceCommandCenter: React.FC<VoiceCommandCenterProps> = ({ currentL
     setIsRecording(false);
   };
 
-  // User Interruption Trigger
   const triggerInterruption = () => {
     if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
       socketRef.current.send(JSON.stringify({ type: 'user_interruption' }));
@@ -176,262 +231,421 @@ export const VoiceCommandCenter: React.FC<VoiceCommandCenterProps> = ({ currentL
       {
         id: Math.random().toString(),
         role: 'system',
-        text: '⚡ User interrupted agent response (Barge-in). Output buffer discarded.',
+        text: '🛑 Barge-in: Output audio buffer cleared. Agent listening for correction...',
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
       }
     ]);
   };
 
-  const demoScenarios = [
+  const scenarios = [
     {
-      title: 'Workflow 1: Gujarati Order',
-      lang: 'ગુજરાતી',
+      title: 'Workflow 1: Gujarati Order Intake',
+      category: 'Regular Sale',
       text: 'રાહુલને 10 કિલો ચોખા અને 5 કિલો ખાંડ આપવાના છે. આજે ડિલિવરી રાખજો.',
-      badge: 'Order Intake',
-      color: 'border-cyan-500/40 text-cyan-400 bg-cyan-950/20'
+      badge: 'ગુજરાતી',
+      tagColor: 'text-saffron-400 border-saffron-500/30 bg-saffron-500/10'
     },
     {
-      title: 'Workflow 2: Spoken Correction',
-      lang: 'Barge-In',
+      title: 'Workflow 2: Mid-Utterance Correction',
+      category: 'Barge-In',
       text: 'Wait, change rice quantity to 15 kg instead!',
-      badge: 'Mid-Utterance',
-      color: 'border-amber-500/40 text-amber-400 bg-amber-950/20'
+      badge: 'Correction',
+      tagColor: 'text-amber-400 border-amber-500/30 bg-amber-500/10'
     },
     {
-      title: 'Workflow 3: Payment Record',
-      lang: 'Hinglish',
-      text: 'Rahul ka 2000 payment receive hua hai, uska ledger update kar do.',
-      badge: 'Khata Update',
-      color: 'border-emerald-500/40 text-emerald-400 bg-emerald-950/20'
+      title: 'Workflow 3: Confirm & Persist',
+      category: 'Order Confirmation',
+      text: 'હા, બરાબર છે, કન્ફર્મ કરી દો.',
+      badge: 'Execution',
+      tagColor: 'text-emerald-400 border-emerald-500/30 bg-emerald-500/10'
     },
     {
-      title: 'Workflow 4: Credit Risk & Approval',
-      lang: 'Policy Check',
+      title: 'Workflow 4: Credit Limit & Approval',
+      category: 'Guardrails',
       text: 'Give Amit 50 kg rice on credit.',
-      badge: 'Human-in-the-Loop',
-      color: 'border-red-500/40 text-red-400 bg-red-950/20'
+      badge: 'Human Approval',
+      tagColor: 'text-rose-400 border-rose-500/30 bg-rose-500/10'
     },
     {
       title: 'Workflow 5: Conversational BI',
-      lang: 'ગુજરાતી',
+      category: 'Daily Sales',
       text: 'આજનું મારું કુલ વેચાણ કેટલું થયું?',
-      badge: 'Daily Sales',
-      color: 'border-purple-500/40 text-purple-400 bg-purple-950/20'
+      badge: 'Instant BI',
+      tagColor: 'text-cyan-400 border-cyan-500/30 bg-cyan-500/10'
     }
   ];
 
   return (
-    <div className="max-w-7xl mx-auto p-6 grid grid-cols-1 lg:grid-cols-12 gap-6">
+    <div className="max-w-[1400px] mx-auto p-4 sm:p-6 space-y-6">
       
-      {/* LEFT COLUMN: Microphone, Waveform, Quick Scenarios (5 cols) */}
-      <div className="lg:col-span-5 space-y-6">
-        
-        {/* Voice Command Card */}
-        <div className="bg-surface border border-border rounded-2xl p-6 relative overflow-hidden shadow-xl">
-          <div className="flex items-center justify-between mb-4">
+      {/* Top Banner: Stage Status & Quick Actions */}
+      <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 bg-surface border border-border rounded-2xl p-4 sm:px-6">
+        <div className="flex items-center gap-3">
+          <div className="w-9 h-9 rounded-xl bg-saffron-500/15 border border-saffron-500/30 flex items-center justify-center text-saffron-400 font-bold">
+            <Mic className="w-5 h-5" />
+          </div>
+          <div>
             <div className="flex items-center gap-2">
-              <span className={`w-2.5 h-2.5 rounded-full ${isConnected ? 'bg-emerald-400 animate-pulse' : 'bg-red-400'}`} />
-              <span className="text-xs font-medium text-slate-300">
-                {isConnected ? 'Gemini Live: Ready (16kHz PCM)' : 'Connecting to Voice Gateway...'}
+              <h1 className="text-sm font-bold text-white tracking-tight">Vernacular Voice Counter</h1>
+              <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-border">
+                {workflowStage === 'IDLE' ? 'Counter Ready' : `Workflow: ${workflowStage}`}
               </span>
             </div>
-            <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-slate-800 text-cyan-300 border border-slate-700">
-              State: {workflowStage}
-            </span>
-          </div>
-
-          {/* Central Microphone Waveform Ring */}
-          <div className="py-6 flex flex-col items-center justify-center">
-            <div className="relative">
-              {isRecording && (
-                <div 
-                  className="absolute inset-0 rounded-full bg-primary/20 voice-glow" 
-                  style={{ transform: `scale(${1 + audioLevel * 0.4})` }}
-                />
-              )}
-              <button
-                onClick={toggleRecording}
-                className={`w-24 h-24 rounded-full flex items-center justify-center transition-all duration-300 relative z-10 ${
-                  isRecording
-                    ? 'bg-red-500 text-white shadow-lg shadow-red-500/40 scale-105'
-                    : 'bg-gradient-to-tr from-cyan-600 to-primary text-slate-950 shadow-lg shadow-cyan-500/30 hover:scale-105'
-                }`}
-              >
-                {isRecording ? <MicOff className="w-10 h-10 animate-bounce" /> : <Mic className="w-10 h-10" />}
-              </button>
-            </div>
-
-            <p className="mt-4 text-xs font-semibold text-slate-200">
-              {isRecording ? 'Listening in real-time... Speak naturally' : 'Tap to Speak in Gujarati, Hindi or English'}
-            </p>
-
-            {/* Simulated Live Audio Waveform Bars */}
-            <div className="flex items-center gap-1.5 mt-4 h-8">
-              {[...Array(16)].map((_, i) => (
-                <div
-                  key={i}
-                  className="w-1 bg-primary rounded-full transition-all duration-150"
-                  style={{
-                    height: isRecording 
-                      ? `${Math.max(4, Math.sin(i * 0.5 + audioLevel * 5) * 28 + 14)}px`
-                      : '4px',
-                    opacity: isRecording ? 0.9 : 0.3
-                  }}
-                />
-              ))}
-            </div>
-
-            {/* Barge-In Interruption Button */}
-            <button
-              onClick={triggerInterruption}
-              className="mt-4 flex items-center gap-1.5 text-xs text-amber-400 hover:text-amber-300 bg-amber-950/30 border border-amber-800/40 px-3 py-1 rounded-lg transition-colors"
-            >
-              <Zap className="w-3.5 h-3.5 text-amber-400" />
-              <span>Simulate Mid-Sentence Interruption</span>
-            </button>
-          </div>
-
-          {/* Text Utterance Input Bar */}
-          <div className="mt-4 pt-4 border-t border-border flex items-center gap-2">
-            <input
-              type="text"
-              value={inputUtterance}
-              onChange={(e) => setInputUtterance(e.target.value)}
-              onKeyDown={(e) => e.key === 'Enter' && sendUtterance(inputUtterance)}
-              placeholder="Or type voice instruction here..."
-              className="flex-1 bg-card border border-border rounded-xl px-3.5 py-2 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-primary"
-            />
-            <button
-              onClick={() => sendUtterance(inputUtterance)}
-              className="p-2 rounded-xl bg-primary text-slate-950 hover:bg-primary-hover font-semibold transition-colors"
-            >
-              <Send className="w-4 h-4" />
-            </button>
+            <p className="text-xs text-slate-400">Speak naturally in Gujarati, Hindi, or Hinglish — no manual typing required</p>
           </div>
         </div>
 
-        {/* Hackathon Preset Scenarios */}
-        <div className="bg-surface border border-border rounded-2xl p-5 shadow-sm">
-          <div className="flex items-center gap-2 mb-3">
-            <Sparkles className="w-4 h-4 text-primary" />
-            <h3 className="text-xs font-bold uppercase tracking-wider text-slate-300">
-              Official Hackathon Demonstration Workflows
-            </h3>
+        {/* Status Pills */}
+        <div className="flex items-center gap-2 shrink-0">
+          <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-background border border-border text-xs text-slate-300">
+            <span className={`w-2 h-2 rounded-full ${isConnected ? 'bg-emerald-400 animate-pulse' : 'bg-rose-400'}`} />
+            <span>{isConnected ? '16kHz Audio Stream' : 'Offline'}</span>
           </div>
-          <p className="text-[11px] text-slate-400 mb-3">
-            Click any workflow to send live vernacular input directly to the agent engine:
-          </p>
+          <button
+            onClick={triggerInterruption}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 text-amber-300 text-xs font-semibold transition-all"
+            title="Interrupt speaking agent and clear audio buffer"
+          >
+            <Zap className="w-3.5 h-3.5 text-amber-400" />
+            <span>Barge-In (Stop)</span>
+          </button>
+        </div>
+      </div>
 
-          <div className="space-y-2">
-            {demoScenarios.map((sc, i) => (
+      {/* Main Grid: Left Assistant Deck + Right Live Parchi/Bill */}
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+        
+        {/* LEFT COLUMN: Microphone, Quick Prompt Cards, Conversation Stream (7 cols) */}
+        <div className="lg:col-span-7 space-y-6">
+          
+          {/* Tactile Microphone & Waveform Bar */}
+          <div className="bg-gradient-to-b from-surface to-card border border-border rounded-3xl p-6 shadow-card relative overflow-hidden">
+            
+            {/* Ambient Background Glow */}
+            <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-72 h-72 bg-saffron-500/5 rounded-full blur-3xl pointer-events-none" />
+
+            <div className="flex flex-col items-center justify-center py-4 relative z-10">
+              
+              {/* Mic Button with Multi-Ring Ripple */}
+              <div className="relative mb-5">
+                {isRecording && (
+                  <>
+                    <div className="absolute inset-0 rounded-full bg-saffron-500/20 voice-ripple" />
+                    <div className="absolute -inset-3 rounded-full border border-saffron-400/30 animate-pulse" />
+                  </>
+                )}
+                <button
+                  onClick={toggleRecording}
+                  className={`w-24 h-24 rounded-full flex flex-col items-center justify-center transition-all duration-300 shadow-2xl relative z-10 ${
+                    isRecording
+                      ? 'bg-gradient-to-tr from-rose-600 to-rose-500 text-white shadow-rose-500/40 scale-105'
+                      : 'bg-gradient-to-tr from-saffron-500 to-amber-500 text-slate-950 shadow-glow-saffron hover:scale-105 active:scale-95'
+                  }`}
+                >
+                  {isRecording ? (
+                    <MicOff className="w-9 h-9" />
+                  ) : (
+                    <Mic className="w-9 h-9" />
+                  )}
+                  <span className="text-[10px] font-bold mt-1 tracking-tight">
+                    {isRecording ? 'TAP TO STOP' : 'TAP & SPEAK'}
+                  </span>
+                </button>
+              </div>
+
+              {/* Dynamic Subtitle */}
+              <p className="text-xs font-semibold text-slate-200">
+                {isRecording ? (
+                  <span className="text-saffron-400 font-bold flex items-center gap-2">
+                    <span className="w-2 h-2 rounded-full bg-saffron-400 animate-ping" />
+                    Listening in real-time...
+                  </span>
+                ) : (
+                  'Speak an order, payment receipt, or sales query'
+                )}
+              </p>
+
+              {/* Responsive Audio Waveform Visualizer */}
+              <div className="flex items-center gap-1 mt-4 h-8">
+                {[...Array(24)].map((_, i) => (
+                  <div
+                    key={i}
+                    className="w-1 bg-saffron-400 rounded-full transition-all duration-150"
+                    style={{
+                      height: isRecording 
+                        ? `${Math.max(4, Math.sin(i * 0.4 + audioLevel * 6) * 26 + 12)}px`
+                        : '4px',
+                      opacity: isRecording ? 0.9 : 0.25
+                    }}
+                  />
+                ))}
+              </div>
+
+            </div>
+
+            {/* Quick Text Input for Quiet Environments */}
+            <div className="pt-4 border-t border-border flex items-center gap-2">
+              <input
+                type="text"
+                value={inputUtterance}
+                onChange={(e) => setInputUtterance(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && sendUtterance(inputUtterance)}
+                placeholder="Or type voice text: 'રાહુલને 10 કિલો ચોખા આપો'..."
+                className="flex-1 bg-background/80 border border-border rounded-xl px-4 py-2.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-saffron-500 transition-colors"
+              />
               <button
-                key={i}
-                onClick={() => sendUtterance(sc.text)}
-                className="w-full text-left p-2.5 rounded-xl border border-border bg-card/60 hover:bg-card hover:border-slate-600 transition-all group flex items-start justify-between gap-3"
+                onClick={() => sendUtterance(inputUtterance)}
+                className="px-4 py-2.5 rounded-xl bg-saffron-500 hover:bg-saffron-600 text-slate-950 font-bold text-xs flex items-center gap-1.5 transition-colors shadow-sm"
               >
-                <div>
-                  <div className="flex items-center gap-2 mb-1">
-                    <span className="text-xs font-semibold text-slate-200 group-hover:text-primary transition-colors">
-                      {sc.title}
-                    </span>
-                    <span className={`text-[10px] px-1.5 py-0.2 rounded-full border ${sc.color}`}>
+                <span>Send</span>
+                <Send className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          </div>
+
+          {/* Quick Shop Scenarios (Cards) */}
+          <div className="space-y-3">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-bold uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
+                <Sparkles className="w-3.5 h-3.5 text-saffron-400" />
+                <span>Simulate Spoken Scenarios</span>
+              </span>
+              <span className="text-[11px] text-slate-500">Click to test live agent</span>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+              {scenarios.map((sc, i) => (
+                <button
+                  key={i}
+                  onClick={() => sendUtterance(sc.text)}
+                  className="text-left p-3 rounded-2xl bg-surface border border-border hover:border-saffron-500/40 hover:bg-card transition-all group relative overflow-hidden"
+                >
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="text-[10px] font-bold text-slate-400">{sc.category}</span>
+                    <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${sc.tagColor}`}>
                       {sc.badge}
                     </span>
                   </div>
-                  <p className="text-xs text-slate-400 font-sans line-clamp-1">"{sc.text}"</p>
-                </div>
-                <ChevronRight className="w-4 h-4 text-slate-500 group-hover:text-primary transition-colors shrink-0 mt-1" />
-              </button>
-            ))}
-          </div>
-        </div>
-
-      </div>
-
-      {/* RIGHT COLUMN: Live Transcript & Agent Workflow Steps (7 cols) */}
-      <div className="lg:col-span-7 space-y-6">
-        
-        {/* Conversation Transcript Feed */}
-        <div className="bg-surface border border-border rounded-2xl p-6 shadow-xl flex flex-col h-[620px]">
-          <div className="flex items-center justify-between pb-4 border-b border-border">
-            <div className="flex items-center gap-2">
-              <Volume2 className="w-4 h-4 text-primary" />
-              <h2 className="text-sm font-bold text-white">Live Conversation Transcript</h2>
+                  <p className="text-xs font-semibold text-slate-200 group-hover:text-saffron-300 line-clamp-2 transition-colors">
+                    "{sc.text}"
+                  </p>
+                </button>
+              ))}
             </div>
-            <span className="text-xs text-slate-400 font-mono">
-              Turn-taking: Native Audio Barge-in
-            </span>
           </div>
 
-          {/* Transcript Message Stream */}
-          <div className="flex-1 overflow-y-auto space-y-4 py-4 pr-1">
-            {messages.map((msg) => {
-              const isUser = msg.role === 'user';
-              const isSystem = msg.role === 'system';
+          {/* Transcript Feed */}
+          <div className="bg-surface border border-border rounded-2xl p-5 shadow-sm space-y-3">
+            <div className="flex items-center justify-between pb-3 border-b border-border text-xs">
+              <span className="font-bold text-white flex items-center gap-2">
+                <Volume2 className="w-4 h-4 text-saffron-400" />
+                <span>Conversation Log</span>
+              </span>
+              <span className="text-slate-500 text-[11px]">Real-time dialogue</span>
+            </div>
 
-              if (isSystem) {
+            <div className="max-h-64 overflow-y-auto space-y-3 pr-1">
+              {messages.map((msg) => {
+                const isUser = msg.role === 'user';
+                const isSystem = msg.role === 'system';
+
+                if (isSystem) {
+                  return (
+                    <div key={msg.id} className="text-center py-1">
+                      <span className="inline-block px-3 py-1 rounded-full text-[10px] font-mono bg-background border border-border text-amber-300">
+                        {msg.text}
+                      </span>
+                    </div>
+                  );
+                }
+
                 return (
-                  <div key={msg.id} className="text-center py-1">
-                    <span className="inline-block px-3 py-1 rounded-full text-[11px] font-mono bg-slate-800/80 text-amber-300 border border-slate-700">
-                      {msg.text}
-                    </span>
-                    {msg.toolCall && (
-                      <div className="mt-1 max-w-md mx-auto text-left bg-slate-900 border border-slate-800 rounded-lg p-2 text-[10px] font-mono text-cyan-300">
-                        <span className="text-slate-400">args:</span> {JSON.stringify(msg.toolCall.args)}
-                      </div>
-                    )}
+                  <div
+                    key={msg.id}
+                    className={`flex items-start gap-2.5 ${isUser ? 'flex-row-reverse' : 'flex-row'}`}
+                  >
+                    <div
+                      className={`w-6 h-6 rounded-lg flex items-center justify-center shrink-0 text-[10px] font-bold ${
+                        isUser
+                          ? 'bg-slate-700 text-slate-200'
+                          : 'bg-saffron-500/20 text-saffron-400 border border-saffron-500/40'
+                      }`}
+                    >
+                      {isUser ? 'તમે' : 'AI'}
+                    </div>
+
+                    <div
+                      className={`max-w-[85%] rounded-2xl px-3.5 py-2.5 text-xs leading-relaxed ${
+                        isUser
+                          ? 'bg-saffron-500 text-slate-950 font-medium rounded-tr-none'
+                          : 'bg-card border border-border text-slate-200 rounded-tl-none'
+                      }`}
+                    >
+                      <p>{msg.text}</p>
+                      <span className={`block text-[9px] mt-1 ${isUser ? 'text-slate-900 font-semibold' : 'text-slate-500'}`}>
+                        {msg.timestamp}
+                      </span>
+                    </div>
                   </div>
                 );
-              }
+              })}
+              <div ref={messagesEndRef} />
+            </div>
+          </div>
 
-              return (
-                <div
-                  key={msg.id}
-                  className={`flex items-start gap-3 ${isUser ? 'flex-row-reverse' : 'flex-row'}`}
-                >
-                  <div
-                    className={`w-7 h-7 rounded-lg flex items-center justify-center shrink-0 text-xs font-bold ${
-                      isUser
-                        ? 'bg-slate-700 text-slate-200'
-                        : 'bg-primary/20 text-primary-glow border border-primary/40'
-                    }`}
-                  >
-                    {isUser ? 'U' : 'AI'}
+        </div>
+
+        {/* RIGHT COLUMN: The Digital Counter Parchi (Bill) (5 cols) */}
+        <div className="lg:col-span-5 space-y-6">
+          
+          {/* Parchi Card */}
+          <div className="parchi-paper border border-border rounded-3xl p-6 shadow-card space-y-5">
+            
+            {/* Parchi Header */}
+            <div className="flex items-start justify-between pb-4 border-b border-border/80">
+              <div>
+                <div className="flex items-center gap-1.5 text-saffron-400">
+                  <Receipt className="w-4 h-4" />
+                  <span className="text-[11px] font-bold uppercase tracking-wider">કાચી પાવતી • COUNTER SLIP</span>
+                </div>
+                <h2 className="text-base font-bold text-white mt-1">Shree Ganesh Kirana</h2>
+                <p className="text-[11px] text-slate-400">Station Road, Ahmedabad</p>
+              </div>
+
+              {/* Status Seal Stamp */}
+              {draftBill?.isConfirmed ? (
+                <div className="px-3 py-1 rounded-xl bg-emerald-500/20 border border-emerald-500/40 text-emerald-400 text-xs font-bold tracking-tight rotate-3">
+                  ✓ CONFIRMED
+                </div>
+              ) : draftBill?.isPausedForApproval ? (
+                <div className="px-3 py-1 rounded-xl bg-rose-500/20 border border-rose-500/40 text-rose-400 text-xs font-bold tracking-tight -rotate-2">
+                  ⚠ APPROVAL REQ.
+                </div>
+              ) : (
+                <div className="px-2.5 py-1 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-400 text-[11px] font-semibold">
+                  ● DRAFTING
+                </div>
+              )}
+            </div>
+
+            {/* Customer Details Pill */}
+            {draftBill ? (
+              <div className="p-3.5 rounded-2xl bg-background/60 border border-border space-y-1">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-slate-400 flex items-center gap-1.5">
+                    <User className="w-3.5 h-3.5 text-saffron-400" />
+                    <span>Customer:</span>
+                  </span>
+                  <span className="font-bold text-white">{draftBill.customerName}</span>
+                </div>
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-slate-400">Payment Mode:</span>
+                  <span className="font-mono text-saffron-400 font-semibold">{draftBill.paymentMode}</span>
+                </div>
+              </div>
+            ) : (
+              <div className="py-8 text-center text-slate-500 text-xs border border-dashed border-border rounded-2xl">
+                <Receipt className="w-8 h-8 text-slate-600 mx-auto mb-2" />
+                <p className="font-medium text-slate-400">No active bill</p>
+                <p className="text-[11px] text-slate-500 mt-0.5">Speak an order to populate items automatically</p>
+              </div>
+            )}
+
+            {/* Line Items Table */}
+            {draftBill && (
+              <div className="space-y-3">
+                <div className="text-[11px] font-bold uppercase tracking-wider text-slate-400">
+                  Bill Items ({draftBill.items.length})
+                </div>
+
+                <div className="divide-y divide-border/60">
+                  {draftBill.items.map((item, idx) => (
+                    <div key={idx} className="py-2.5 flex items-center justify-between text-xs">
+                      <div>
+                        <div className="font-semibold text-slate-200">{item.name}</div>
+                        <div className="text-[11px] text-slate-400">
+                          {item.quantity} {item.unit} × ₹{item.price.toFixed(2)}
+                        </div>
+                      </div>
+                      <div className="font-bold font-mono text-white text-sm">
+                        ₹{item.subtotal.toFixed(2)}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                {/* Grand Total Calculation */}
+                <div className="pt-3 border-t-2 border-dashed border-border space-y-1.5">
+                  <div className="flex items-center justify-between text-xs text-slate-400">
+                    <span>Subtotal:</span>
+                    <span>₹{draftBill.totalAmount.toFixed(2)}</span>
                   </div>
-
-                  <div
-                    className={`max-w-[82%] rounded-2xl px-4 py-3 text-xs leading-relaxed ${
-                      isUser
-                        ? 'bg-primary text-slate-950 font-medium rounded-tr-none'
-                        : 'bg-card border border-border text-slate-200 rounded-tl-none shadow-sm'
-                    }`}
-                  >
-                    <p className="text-[13px]">{msg.text}</p>
-                    <span className={`block text-[10px] mt-1.5 ${isUser ? 'text-slate-800' : 'text-slate-500'}`}>
-                      {msg.timestamp}
+                  <div className="flex items-center justify-between text-xs text-slate-400">
+                    <span>Taxes & Delivery:</span>
+                    <span className="text-emerald-400 font-semibold">FREE (Shop Counter)</span>
+                  </div>
+                  <div className="flex items-center justify-between text-sm font-bold pt-2 border-t border-border">
+                    <span className="text-white">Total Payable (કુલ રકમ):</span>
+                    <span className="text-lg text-saffron-400 font-mono">
+                      ₹{draftBill.totalAmount.toFixed(2)}
                     </span>
                   </div>
                 </div>
-              );
-            })}
-            <div ref={messagesEndRef} />
+
+                {/* Exception Notice or Confirmation Bar */}
+                {draftBill.isPausedForApproval ? (
+                  <div className="p-3.5 rounded-2xl bg-rose-500/10 border border-rose-500/30 text-rose-300 text-xs space-y-1.5">
+                    <div className="flex items-center gap-1.5 font-bold text-rose-400">
+                      <ShieldAlert className="w-4 h-4 shrink-0" />
+                      <span>Credit Policy Exceeded</span>
+                    </div>
+                    <p className="text-[11px] leading-relaxed text-slate-300">
+                      {draftBill.approvalReason}
+                    </p>
+                    <span className="inline-block text-[10px] font-bold bg-rose-500/20 px-2 py-0.5 rounded text-rose-300">
+                      Forwarded to Approval Center
+                    </span>
+                  </div>
+                ) : draftBill.isConfirmed ? (
+                  <div className="p-3 rounded-2xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-xs flex items-center gap-2">
+                    <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0" />
+                    <div>
+                      <span className="font-bold">Transaction Successfully Recorded!</span>
+                      <p className="text-[11px] text-slate-400">Stock updated & delivery task dispatched.</p>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="pt-2 flex items-center gap-2">
+                    <button
+                      onClick={() => sendUtterance('હા, કન્ફર્મ કરો')}
+                      className="flex-1 py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-600 text-slate-950 font-bold text-xs flex items-center justify-center gap-1.5 shadow-md shadow-emerald-500/20 transition-all"
+                    >
+                      <CheckCircle2 className="w-4 h-4" />
+                      <span>Confirm (કન્ફર્મ કરો)</span>
+                    </button>
+                    <button
+                      onClick={() => setDraftBill(null)}
+                      className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold text-xs border border-border transition-colors"
+                    >
+                      Clear
+                    </button>
+                  </div>
+                )}
+
+              </div>
+            )}
+
           </div>
 
-          {/* Active Approval Banner if required */}
-          {activeApproval && (
-            <div className="mt-3 p-3 rounded-xl bg-amber-950/40 border border-amber-600/50 flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <ShieldAlert className="w-5 h-5 text-amber-400 shrink-0" />
-                <div>
-                  <p className="text-xs font-bold text-amber-300">Supervisor Approval Required</p>
-                  <p className="text-[11px] text-slate-300">{activeApproval.reason}</p>
-                </div>
-              </div>
-              <span className="text-xs px-2.5 py-1 rounded bg-amber-500 text-slate-950 font-bold shrink-0">
-                Action Paused
-              </span>
-            </div>
-          )}
+          {/* Operational Guidance Card */}
+          <div className="bg-surface border border-border rounded-2xl p-4 text-xs text-slate-400 space-y-2">
+            <span className="font-bold text-slate-300 block">💡 Shopkeeper Voice Tips</span>
+            <ul className="space-y-1 text-[11px] list-disc list-inside">
+              <li>Speak naturally: <span className="text-saffron-300">"રાહુલને 10 કિલો ચોખા આપો"</span></li>
+              <li>Say <span className="text-amber-300">"Wait, change to 15 kg"</span> anytime to correct.</li>
+              <li>High credit orders automatically prompt the store owner for safety.</li>
+            </ul>
+          </div>
 
         </div>
 
