@@ -3,7 +3,7 @@ from app.models.models import (
     DeliveryStatus, ApprovalStatus, RiskLevel, SessionStatus,
     Organization, User, Customer, Product, Inventory, InventoryMovement,
     Order, OrderItem, LedgerEntry, Payment, DeliveryTask, Approval,
-    VoiceSession, WorkflowRun, WorkflowStep, AuditLog, AgentToolCall
+    VoiceSession, WorkflowRun, WorkflowStep, AuditLog, AgentToolCall, SessionMetric
 )
 
 __all__ = [
@@ -11,5 +11,5 @@ __all__ = [
     "DeliveryStatus", "ApprovalStatus", "RiskLevel", "SessionStatus",
     "Organization", "User", "Customer", "Product", "Inventory", "InventoryMovement",
     "Order", "OrderItem", "LedgerEntry", "Payment", "DeliveryTask", "Approval",
-    "VoiceSession", "WorkflowRun", "WorkflowStep", "AuditLog", "AgentToolCall"
+    "VoiceSession", "WorkflowRun", "WorkflowStep", "AuditLog", "AgentToolCall", "SessionMetric"
 ]

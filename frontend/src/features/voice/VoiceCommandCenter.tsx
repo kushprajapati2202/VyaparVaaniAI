@@ -1,698 +1,415 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { 
-  Mic, MicOff, Volume2, Sparkles, AlertTriangle, CheckCircle2, 
-  Send, Zap, ChevronRight, Receipt, User, Clock, ShieldAlert,
-  ArrowUpRight, CornerDownLeft, VolumeX, ListChecks, Smartphone
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  Mic, MicOff, Volume2, Sparkles, Send, Zap, Receipt, Gauge, IndianRupee, Radio, ShieldCheck, Ear,
 } from 'lucide-react';
-import { VoiceMessage } from '../../types';
+import { ActivityEntry, AgentAction, VoiceMessage } from '../../types';
+import { VOICE_WS_URL } from '../../services/api';
+import { MicStreamer, PcmPlayer, base64ToArrayBuffer, createBrowserRecognizer } from './audio';
+import { ParchiCard } from './ParchiCard';
+import { ActivityTimeline } from './ActivityTimeline';
 
 interface VoiceCommandCenterProps {
   currentLanguage: string;
   onRefreshData?: () => void;
 }
 
-interface DraftBillItem {
-  name: string;
-  quantity: number;
-  unit: string;
-  price: number;
-  subtotal: number;
-}
+type Mode = 'connecting' | 'live' | 'fallback' | 'offline';
+
+const ECHO_GUARD_RMS = 0.045; // while the agent talks, only forward mic frames louder than this (likely real speech)
+const now = () => new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+const uid = () => Math.random().toString(36).slice(2);
+
+const SCENARIOS = [
+  { category: 'Gujarati order', badge: 'ગુજરાતી', text: 'રાહુલભાઈને 10 કિલો ચોખા અને 5 કિલો ખાંડ આપવાના છે, ખાતામાં લખજો.', tag: 'text-saffron-400 border-saffron-500/30 bg-saffron-500/10' },
+  { category: 'Spoken correction', badge: 'Hinglish', text: 'Nahi nahi, chawal 15 kilo kar do.', tag: 'text-amber-400 border-amber-500/30 bg-amber-500/10' },
+  { category: 'Confirm', badge: 'Execute', text: 'હા, બરાબર છે, કન્ફર્મ કરો.', tag: 'text-emerald-400 border-emerald-500/30 bg-emerald-500/10' },
+  { category: 'Credit limit → owner', badge: 'Approval', text: 'Amit bhai ko 50 kilo chawal udhaar pe de do.', tag: 'text-rose-400 border-rose-500/30 bg-rose-500/10' },
+  { category: 'Ambiguous name', badge: 'Exception', text: 'કિરણભાઈને 2 લીટર તેલ આપવાનું છે.', tag: 'text-violet-300 border-violet-500/30 bg-violet-500/10' },
+  { category: 'Khata payment', badge: 'हिन्दी', text: 'महेश प्रोविजन स्टोर के 2000 रुपये UPI से जमा करो।', tag: 'text-cyan-400 border-cyan-500/30 bg-cyan-500/10' },
+  { category: 'Undo', badge: 'Safety', text: 'Galti ho gayi, last entry undo karo.', tag: 'text-slate-300 border-slate-500/30 bg-slate-500/10' },
+  { category: 'Daily sales', badge: 'BI', text: 'આજનું કુલ વેચાણ કેટલું થયું?', tag: 'text-sky-300 border-sky-500/30 bg-sky-500/10' },
+];
 
 export const VoiceCommandCenter: React.FC<VoiceCommandCenterProps> = ({ currentLanguage, onRefreshData }) => {
-  const [isRecording, setIsRecording] = useState(false);
-  const [isConnected, setIsConnected] = useState(false);
+  const [mode, setMode] = useState<Mode>('connecting');
+  const [model, setModel] = useState<string>('');
+  const [micOn, setMicOn] = useState(false);
+  const [micLevel, setMicLevel] = useState(0);
+  const [agentSpeaking, setAgentSpeaking] = useState(false);
+  const [echoGuard, setEchoGuard] = useState(true);
   const [mobileTab, setMobileTab] = useState<'mic' | 'bill'>('mic');
-  const [messages, setMessages] = useState<VoiceMessage[]>([
-    {
-      id: 'init-1',
-      role: 'agent',
-      text: 'નમસ્તે! હું વ્યાપારવાણી AI છું. આજે તમે કયો ઓર્ડર અથવા હિસાબ કરવા માંગો છો?',
-      timestamp: 'Just now'
-    }
-  ]);
+  const [messages, setMessages] = useState<VoiceMessage[]>([]);
+  const [partial, setPartial] = useState<{ user: string; agent: string }>({ user: '', agent: '' });
   const [inputUtterance, setInputUtterance] = useState('');
-  const [workflowStage, setWorkflowStage] = useState<string>('IDLE');
-  const [activeApproval, setActiveApproval] = useState<any>(null);
-  const [audioLevel, setAudioLevel] = useState<number>(0);
-  
-  // Real-time Visual Draft Bill State (Parchi / પાવતી)
-  const [draftBill, setDraftBill] = useState<{
-    customerName: string;
-    items: DraftBillItem[];
-    paymentMode: string;
-    totalAmount: number;
-    orderNumber?: string;
-    isConfirmed?: boolean;
-    isPausedForApproval?: boolean;
-    approvalReason?: string;
-  } | null>(null);
+  const [action, setAction] = useState<AgentAction | null>(null);
+  const [activity, setActivity] = useState<ActivityEntry[]>([]);
+  const [latencies, setLatencies] = useState<number[]>([]);
+  const [costUsd, setCostUsd] = useState(0);
+  const [biCard, setBiCard] = useState<any>(null);
+  const [error, setError] = useState<string | null>(null);
 
   const socketRef = useRef<WebSocket | null>(null);
-  const messagesEndRef = useRef<HTMLDivElement | null>(null);
-
+  const playerRef = useRef<PcmPlayer | null>(null);
+  const micRef = useRef<MicStreamer | null>(null);
+  const recognizerRef = useRef<any>(null);
+  const modeRef = useRef<Mode>('connecting');
+  const echoGuardRef = useRef(true);
   const reconnectTimerRef = useRef<any>(null);
+  const messagesEndRef = useRef<HTMLDivElement | null>(null);
+  const unmountedRef = useRef(false);
 
-  useEffect(() => {
-    connectWebSocket();
-    return () => {
-      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
-      if (socketRef.current) socketRef.current.close();
-    };
+  useEffect(() => { echoGuardRef.current = echoGuard; }, [echoGuard]);
+
+  const player = () => {
+    if (!playerRef.current) playerRef.current = new PcmPlayer(24000);
+    return playerRef.current;
+  };
+
+  const addActivity = useCallback((e: Omit<ActivityEntry, 'id' | 'at'>) => {
+    setActivity((prev) => [...prev.slice(-150), { ...e, id: uid(), at: now() }]);
   }, []);
 
-  const connectWebSocket = () => {
-    try {
-      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
-      const ws = new WebSocket('ws://localhost:8000/api/v1/voice/live');
-      socketRef.current = ws;
+  const addMessage = useCallback((role: VoiceMessage['role'], text: string) => {
+    setMessages((prev) => [...prev.slice(-80), { id: uid(), role, text, timestamp: now() }]);
+  }, []);
 
-      ws.onopen = () => setIsConnected(true);
-      ws.onmessage = async (event) => {
-        if (typeof event.data === 'string') {
-          const data = JSON.parse(event.data);
-          handleServerEvent(data);
-        } else if (event.data instanceof Blob) {
-          playAudioBlob(event.data);
-        }
-      };
-      ws.onclose = () => {
-        setIsConnected(false);
-        // Automatic exponential backoff reconnection for shopkeeper reliability
-        reconnectTimerRef.current = setTimeout(connectWebSocket, 3000);
-      };
-      ws.onerror = () => {
-        setIsConnected(false);
-      };
-    } catch (e) {
-      console.warn('WebSocket connection error:', e);
-      reconnectTimerRef.current = setTimeout(connectWebSocket, 3000);
-    }
-  };
-
-  const handleServerEvent = (data: any) => {
-    if (data.type === 'transcript') {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: Math.random().toString(),
-          role: data.role,
-          text: data.text,
-          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-        }
-      ]);
-      setWorkflowStage('READY');
-
-      // Update draft bill state based on agent dialog
-      if (data.text.includes('ચોખાનો જથ્થો') && draftBill) {
-        const updated = { ...draftBill };
-        if (updated.items.length > 0) {
-          updated.items[0].quantity = 15;
-          updated.items[0].subtotal = 15 * updated.items[0].price;
-          updated.totalAmount = updated.items.reduce((s, it) => s + it.subtotal, 0);
-          setDraftBill(updated);
-        }
-      } else if (data.text.includes('સફળતાપૂર્વક કન્ફર્મ') && draftBill) {
-        setDraftBill({
-          ...draftBill,
-          isConfirmed: true,
-          orderNumber: 'VV-2026-0001'
+  const handleServerEvent = useCallback((data: any) => {
+    switch (data.type) {
+      case 'session_started':
+        modeRef.current = data.mode;
+        setMode(data.mode);
+        setModel(data.model || data.brain || '');
+        setError(null);
+        addActivity({ kind: 'info', title: data.mode === 'live' ? `Gemini Live connected (${data.model})` : `Fallback mode: ${data.reason}` });
+        break;
+      case 'session_resumed':
+        addActivity({ kind: 'info', title: 'Gemini Live session resumed (network blip handled)' });
+        break;
+      case 'context_reset':
+        addActivity({ kind: 'info', title: 'Transaction closed: fresh AI context for the next customer (keeps cost per txn flat)' });
+        break;
+      case 'transcript_partial':
+        setPartial((p) => ({ ...p, [data.role]: p[data.role as 'user' | 'agent'] + data.text }));
+        break;
+      case 'transcript':
+        addMessage(data.role, data.interrupted ? `${data.text} …` : data.text);
+        setPartial((p) => ({ ...p, [data.role]: '' }));
+        break;
+      case 'turn_complete':
+        setPartial({ user: '', agent: '' });
+        break;
+      case 'barge_in':
+        playerRef.current?.flush();
+        setAgentSpeaking(false);
+        setPartial((p) => ({ ...p, agent: '' }));
+        addActivity({ kind: 'barge_in', title: data.source === 'voice' ? 'Barge-in: user spoke over the agent, playback cut' : 'Agent stopped manually' });
+        break;
+      case 'latency':
+        setLatencies((l) => [...l.slice(-49), data.ms]);
+        break;
+      case 'usage':
+        setCostUsd(data.cost_usd || 0);
+        break;
+      case 'tool_call':
+        addActivity({
+          kind: 'tool', title: `${data.tool}()`, ok: data.success, latencyMs: data.latency_ms,
+          status: data.error_code || (data.success ? 'OK' : 'ERROR'),
+          detail: Object.entries(data.args || {}).map(([k, v]) => `${k}=${typeof v === 'object' ? JSON.stringify(v) : v}`).join(' · '),
         });
-      }
-
-      if (onRefreshData) onRefreshData();
-    } else if (data.type === 'workflow_update') {
-      setWorkflowStage(data.step);
-    } else if (data.type === 'tool_executed') {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: Math.random().toString(),
-          role: 'system',
-          text: `⚡ Function Call: ${data.tool}`,
-          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-          toolCall: { tool: data.tool, args: data.args, result: data.result }
-        }
-      ]);
-    } else if (data.type === 'approval_required') {
-      setActiveApproval(data);
-      setWorkflowStage('APPROVAL_PENDING');
-      if (draftBill) {
-        setDraftBill({
-          ...draftBill,
-          isPausedForApproval: true,
-          approvalReason: data.reason
-        });
-      }
-      if (onRefreshData) onRefreshData();
+        if (['confirm_action', 'undo_last_action'].includes(data.tool) && onRefreshData) onRefreshData();
+        break;
+      case 'workflow_step':
+        addActivity({ kind: 'step', title: data.step, status: data.status, human: data.human, detail: `${data.workflow} · ${data.action_id}` });
+        break;
+      case 'action_update':
+        setAction(data.action);
+        if (window.innerWidth < 1024 && data.action.status === 'AWAITING_CONFIRMATION') setMobileTab('bill');
+        break;
+      case 'exception':
+        addActivity({ kind: 'exception', title: `Exception: ${data.code}`, detail: data.message, ok: false });
+        break;
+      case 'approval_required':
+        addActivity({ kind: 'approval', title: `Owner approval requested: ${data.order_number}`, detail: data.reason, human: true });
+        onRefreshData?.();
+        break;
+      case 'approval_resolved':
+        addActivity({ kind: 'approval', title: `Owner ${data.approved ? 'APPROVED' : 'REJECTED'} ${data.order_number ?? ''}`, detail: data.approver_notes, human: true });
+        onRefreshData?.();
+        break;
+      case 'bi_card':
+        setBiCard(data.metrics);
+        break;
+      case 'audio_mp3':
+        player().playEncoded(base64ToArrayBuffer(data.data)).catch(() => undefined);
+        break;
+      case 'error':
+        setError(data.message || data.code);
+        addActivity({ kind: 'exception', title: `Error: ${data.code}`, detail: data.message, ok: false });
+        break;
     }
-  };
+  }, [addActivity, addMessage, onRefreshData]);
 
-  const playAudioBlob = async (blob: Blob) => {
-    try {
-      const audioUrl = URL.createObjectURL(blob);
-      const audio = new Audio(audioUrl);
-      await audio.play();
-    } catch (e) {
-      console.warn('Audio playback error:', e);
-    }
-  };
+  const connectWebSocket = useCallback(() => {
+    if (unmountedRef.current) return;
+    if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+    setMode('connecting');
+    const ws = new WebSocket(VOICE_WS_URL);
+    ws.binaryType = 'arraybuffer';
+    socketRef.current = ws;
+    ws.onmessage = (event) => {
+      if (typeof event.data === 'string') {
+        handleServerEvent(JSON.parse(event.data));
+      } else {
+        player().playPcm16(event.data as ArrayBuffer);
+        setAgentSpeaking(true);
+      }
+    };
+    ws.onclose = () => {
+      modeRef.current = 'offline';
+      setMode('offline');
+      if (!unmountedRef.current) reconnectTimerRef.current = setTimeout(connectWebSocket, 3000);
+    };
+  }, [handleServerEvent]);
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+    unmountedRef.current = false;
+    connectWebSocket();
+    const speakingPoll = setInterval(() => setAgentSpeaking(!!playerRef.current?.playing), 200);
+    return () => {
+      unmountedRef.current = true;
+      clearInterval(speakingPoll);
+      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+      micRef.current?.stop();
+      recognizerRef.current?.stop?.();
+      socketRef.current?.close();
+      playerRef.current?.close();
+      playerRef.current = null;
+    };
+  }, [connectWebSocket]);
 
-  const toggleRecording = () => {
-    if (!isRecording) {
-      setIsRecording(true);
-      setWorkflowStage('LISTENING');
-      simulateWaveform();
-    } else {
-      setIsRecording(false);
-      setWorkflowStage('PROCESSING');
-      setAudioLevel(0);
-    }
-  };
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }, [messages, partial]);
 
-  const simulateWaveform = () => {
-    const interval = setInterval(() => {
-      setAudioLevel(Math.random() * 0.7 + 0.3);
-    }, 120);
-    setTimeout(() => {
-      clearInterval(interval);
-      if (isRecording) setAudioLevel(0.15);
-    }, 4500);
+  const sendJson = (obj: any) => {
+    const ws = socketRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
   };
 
   const sendUtterance = (text: string) => {
     if (!text.trim()) return;
-
-    const lower = text.toLowerCase();
-    if (lower.includes('rahul') || text.includes('રાહુલ')) {
-      const isCorrected = lower.includes('15') || lower.includes('change');
-      const qtyRice = isCorrected ? 15 : 10;
-      setDraftBill({
-        customerName: 'Rahul Patel (રાહુલ પટેલ)',
-        paymentMode: 'Khata Credit (ઉધાર)',
-        items: [
-          { name: 'Basmati Rice (ચોખા)', quantity: qtyRice, unit: 'kg', price: 60, subtotal: qtyRice * 60 },
-          { name: 'Sugar M-30 (ખાંડ)', quantity: 5, unit: 'kg', price: 45, subtotal: 225 },
-        ],
-        totalAmount: (qtyRice * 60) + 225,
-        isConfirmed: false
-      });
-    } else if (lower.includes('amit') || text.includes('અમિત')) {
-      setDraftBill({
-        customerName: 'Amit Shah (અમિત શાહ)',
-        paymentMode: 'Khata Credit (ઉધાર)',
-        items: [
-          { name: 'Basmati Rice (ચોખા)', quantity: 50, unit: 'kg', price: 60, subtotal: 3000 },
-        ],
-        totalAmount: 3000,
-        isConfirmed: false,
-        isPausedForApproval: true,
-        approvalReason: 'Credit limit of ₹10,000 exceeded. Current balance: ₹7,500.'
-      });
-    }
-
-    if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
-      socketRef.current.send(JSON.stringify({ type: 'user_text', text }));
-    } else {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: Math.random().toString(),
-          role: 'user',
-          text,
-          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-        }
-      ]);
-    }
+    player().resume();
+    sendJson({ type: 'user_text', text });
     setInputUtterance('');
-    setIsRecording(false);
   };
 
-  const triggerInterruption = () => {
-    if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
-      socketRef.current.send(JSON.stringify({ type: 'user_interruption' }));
+  const startMic = async () => {
+    setError(null);
+    await player().resume();
+    if (modeRef.current === 'fallback') {
+      const rec = createBrowserRecognizer(currentLanguage, (t) => sendUtterance(t));
+      if (!rec) { setError('This browser has no speech recognition. Use Chrome, or type.'); return; }
+      recognizerRef.current = rec;
+      rec.start();
+      setMicOn(true);
+      return;
     }
-    setMessages((prev) => [
-      ...prev,
-      {
-        id: Math.random().toString(),
-        role: 'system',
-        text: '🛑 Barge-in: Output buffer cleared. Agent listening for correction...',
-        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-      }
-    ]);
+    try {
+      const mic = new MicStreamer();
+      await mic.start(({ pcm, rms }) => {
+        setMicLevel(rms);
+        const ws = socketRef.current;
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        // Echo guard: while agent audio plays, quiet frames are probably speaker echo -> send silence instead
+        if (echoGuardRef.current && playerRef.current?.playing && rms < ECHO_GUARD_RMS) {
+          ws.send(new ArrayBuffer(pcm.byteLength));
+        } else {
+          ws.send(pcm);
+        }
+      });
+      micRef.current = mic;
+      setMicOn(true);
+    } catch (e: any) {
+      setError(`Microphone unavailable: ${e?.message || e}`);
+    }
   };
 
-  const scenarios = [
-    {
-      title: 'Workflow 1: Gujarati Order Intake',
-      category: 'Regular Sale',
-      text: 'રાહુલને 10 કિલો ચોખા અને 5 કિલો ખાંડ આપવાના છે. આજે ડિલિવરી રાખજો.',
-      badge: 'ગુજરાતી',
-      tagColor: 'text-saffron-400 border-saffron-500/30 bg-saffron-500/10'
-    },
-    {
-      title: 'Workflow 2: Mid-Utterance Correction',
-      category: 'Barge-In',
-      text: 'Wait, change rice quantity to 15 kg instead!',
-      badge: 'Correction',
-      tagColor: 'text-amber-400 border-amber-500/30 bg-amber-500/10'
-    },
-    {
-      title: 'Workflow 3: Confirm & Persist',
-      category: 'Execution',
-      text: 'હા, બરાબર છે, કન્ફર્મ કરી દો.',
-      badge: 'Execute',
-      tagColor: 'text-emerald-400 border-emerald-500/30 bg-emerald-500/10'
-    },
-    {
-      title: 'Workflow 4: Credit Limit & Approval',
-      category: 'Guardrails',
-      text: 'Give Amit 50 kg rice on credit.',
-      badge: 'Approval',
-      tagColor: 'text-rose-400 border-rose-500/30 bg-rose-500/10'
-    },
-    {
-      title: 'Workflow 5: Conversational BI',
-      category: 'Daily Sales',
-      text: 'આજનું મારું કુલ વેચાણ કેટલું થયું?',
-      badge: 'Instant BI',
-      tagColor: 'text-cyan-400 border-cyan-500/30 bg-cyan-500/10'
-    }
-  ];
+  const stopMic = () => {
+    micRef.current?.stop();
+    micRef.current = null;
+    recognizerRef.current?.stop?.();
+    recognizerRef.current = null;
+    setMicOn(false);
+    setMicLevel(0);
+    if (modeRef.current === 'live') sendJson({ type: 'audio_stream_end' });
+  };
+
+  const stopAgent = () => {
+    playerRef.current?.flush();
+    sendJson({ type: 'user_interruption' });
+  };
+
+  const lastLatency = latencies.length ? latencies[latencies.length - 1] : null;
+  const avgLatency = latencies.length ? Math.round(latencies.reduce((a, b) => a + b, 0) / latencies.length) : null;
+  const modeBadge = {
+    connecting: { text: 'Connecting…', cls: 'bg-slate-700 text-slate-300', dot: 'bg-slate-400' },
+    live: { text: `Gemini Live · ${model}`, cls: 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30', dot: 'bg-emerald-400 animate-pulse' },
+    fallback: { text: `Fallback · ${model}`, cls: 'bg-amber-500/10 text-amber-300 border-amber-500/30', dot: 'bg-amber-400' },
+    offline: { text: 'Offline · retrying', cls: 'bg-rose-500/10 text-rose-300 border-rose-500/30', dot: 'bg-rose-400' },
+  }[mode];
 
   return (
     <div className="max-w-[1400px] mx-auto p-3 sm:p-6 space-y-4 sm:space-y-6">
-      
-      {/* Top Banner: Stage Status & Quick Actions */}
-      <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 bg-surface border border-border rounded-2xl p-4">
-        <div className="flex items-center gap-3">
-          <div className="w-9 h-9 rounded-xl bg-saffron-500/15 border border-saffron-500/30 flex items-center justify-center text-saffron-400 font-bold shrink-0">
-            <Mic className="w-5 h-5" />
-          </div>
-          <div>
-            <div className="flex items-center gap-2 flex-wrap">
-              <h1 className="text-sm font-bold text-white tracking-tight">Vernacular Voice Counter</h1>
-              <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-border">
-                {workflowStage === 'IDLE' ? 'Counter Ready' : `Workflow: ${workflowStage}`}
-              </span>
-            </div>
-            <p className="text-xs text-slate-400 line-clamp-1">Speak in Gujarati, Hindi, or Hinglish — zero typing</p>
+      {/* Status bar */}
+      <div className="flex flex-col lg:flex-row items-start lg:items-center justify-between gap-3 bg-surface border border-border rounded-2xl p-4">
+        <div className="flex items-center gap-3 min-w-0">
+          <div className="w-9 h-9 rounded-xl bg-saffron-500/15 border border-saffron-500/30 flex items-center justify-center text-saffron-400 shrink-0"><Mic className="w-5 h-5" /></div>
+          <div className="min-w-0">
+            <h1 className="text-sm font-bold text-white tracking-tight">Vernacular Voice Counter</h1>
+            <p className="text-xs text-slate-400 line-clamp-1">Speak Gujarati, Hindi, Hinglish or English. Interrupt any time.</p>
           </div>
         </div>
-
-        {/* Status & Barge-in Controls */}
-        <div className="flex items-center gap-2 self-stretch sm:self-auto justify-between sm:justify-end shrink-0">
-          <div className="flex items-center gap-2 px-2.5 py-1.5 rounded-xl bg-background border border-border text-xs text-slate-300">
-            <span className={`w-2 h-2 rounded-full shrink-0 ${isConnected ? 'bg-emerald-400 animate-pulse' : 'bg-rose-400'}`} />
-            <span className="text-[11px] font-mono">{isConnected ? '16kHz PCM' : 'Offline'}</span>
-          </div>
-          <button
-            onClick={triggerInterruption}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 text-amber-300 text-xs font-semibold transition-all active:scale-95"
-            title="Interrupt speaking agent and clear audio buffer"
-          >
-            <Zap className="w-3.5 h-3.5 text-amber-400" />
-            <span>Barge-In (Stop)</span>
+        <div className="flex flex-wrap items-center gap-2 text-[11px] font-mono">
+          <span className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl border ${modeBadge.cls}`}><span className={`w-2 h-2 rounded-full ${modeBadge.dot}`} />{modeBadge.text}</span>
+          <span className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl border border-border bg-background text-cyan-300" title="Time from the end of your speech to the agent's first audio">
+            <Gauge className="w-3.5 h-3.5" />{lastLatency != null ? `${lastLatency} ms` : '- ms'}{avgLatency != null && <span className="text-slate-500">avg {avgLatency}</span>}
+          </span>
+          <span className="flex items-center gap-1 px-2.5 py-1.5 rounded-xl border border-border bg-background text-slate-300" title="Gemini Live token cost this session">
+            <IndianRupee className="w-3.5 h-3.5" />{(costUsd * 84).toFixed(2)} AI cost
+          </span>
+          <button onClick={() => setEchoGuard((v) => !v)} className={`flex items-center gap-1 px-2.5 py-1.5 rounded-xl border ${echoGuard ? 'border-emerald-500/30 text-emerald-300' : 'border-border text-slate-500'}`} title="Suppress speaker echo while the agent talks (use without headphones)">
+            <ShieldCheck className="w-3.5 h-3.5" />Echo guard {echoGuard ? 'on' : 'off'}
+          </button>
+          <button onClick={stopAgent} className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 text-amber-300 font-semibold active:scale-95">
+            <Zap className="w-3.5 h-3.5" />Stop agent
           </button>
         </div>
       </div>
 
-      {/* Mobile Tab Switcher: Only visible on screens < lg */}
+      {error && <div className="p-3 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-300 text-xs">{error}</div>}
+
+      {/* Mobile tabs */}
       <div className="lg:hidden flex items-center bg-card p-1 rounded-2xl border border-border">
-        <button
-          onClick={() => setMobileTab('mic')}
-          className={`flex-1 flex items-center justify-center gap-2 py-2 rounded-xl text-xs font-bold transition-all ${
-            mobileTab === 'mic'
-              ? 'bg-saffron-500 text-slate-950 shadow-sm'
-              : 'text-slate-400 hover:text-white'
-          }`}
-        >
-          <Mic className="w-4 h-4" />
-          <span>Voice Deck & Scenarios</span>
-        </button>
-        <button
-          onClick={() => setMobileTab('bill')}
-          className={`flex-1 flex items-center justify-center gap-2 py-2 rounded-xl text-xs font-bold transition-all ${
-            mobileTab === 'bill'
-              ? 'bg-saffron-500 text-slate-950 shadow-sm'
-              : 'text-slate-400 hover:text-white'
-          }`}
-        >
-          <Receipt className="w-4 h-4" />
-          <span>Digital Slip {draftBill ? `(₹${draftBill.totalAmount})` : ''}</span>
-          {draftBill && (
-            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
-          )}
+        <button onClick={() => setMobileTab('mic')} className={`flex-1 flex items-center justify-center gap-2 py-2 rounded-xl text-xs font-bold ${mobileTab === 'mic' ? 'bg-saffron-500 text-slate-950' : 'text-slate-400'}`}><Mic className="w-4 h-4" />Voice</button>
+        <button onClick={() => setMobileTab('bill')} className={`flex-1 flex items-center justify-center gap-2 py-2 rounded-xl text-xs font-bold ${mobileTab === 'bill' ? 'bg-saffron-500 text-slate-950' : 'text-slate-400'}`}>
+          <Receipt className="w-4 h-4" />Slip & activity{action?.status === 'AWAITING_CONFIRMATION' && <span className="w-2 h-2 rounded-full bg-amber-400 animate-ping" />}
         </button>
       </div>
 
-      {/* Main Grid: Left Assistant Deck + Right Live Parchi/Bill */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-        
-        {/* LEFT COLUMN: Microphone, Quick Prompt Cards, Conversation Stream (7 cols) */}
+        {/* LEFT */}
         <div className={`lg:col-span-7 space-y-5 ${mobileTab === 'bill' ? 'hidden lg:block' : 'block'}`}>
-          
-          {/* Tactile Microphone & Waveform Bar */}
           <div className="bg-gradient-to-b from-surface to-card border border-border rounded-3xl p-5 sm:p-6 shadow-card relative overflow-hidden">
-            
-            {/* Ambient Background Glow */}
-            <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-72 h-72 bg-saffron-500/5 rounded-full blur-3xl pointer-events-none" />
-
             <div className="flex flex-col items-center justify-center py-3 relative z-10">
-              
-              {/* Mic Button with Multi-Ring Ripple */}
               <div className="relative mb-4">
-                {isRecording && (
-                  <>
-                    <div className="absolute inset-0 rounded-full bg-saffron-500/20 voice-ripple" />
-                    <div className="absolute -inset-3 rounded-full border border-saffron-400/30 animate-pulse" />
-                  </>
-                )}
+                {micOn && <div className="absolute inset-0 rounded-full bg-saffron-500/20 voice-ripple" />}
                 <button
-                  onClick={toggleRecording}
-                  className={`w-20 h-20 sm:w-24 sm:h-24 rounded-full flex flex-col items-center justify-center transition-all duration-300 shadow-2xl relative z-10 ${
-                    isRecording
-                      ? 'bg-gradient-to-tr from-rose-600 to-rose-500 text-white shadow-rose-500/40 scale-105'
-                      : 'bg-gradient-to-tr from-saffron-500 to-amber-500 text-slate-950 shadow-glow-saffron hover:scale-105 active:scale-95'
-                  }`}
+                  onClick={micOn ? stopMic : startMic}
+                  disabled={mode === 'connecting' || mode === 'offline'}
+                  className={`w-20 h-20 sm:w-24 sm:h-24 rounded-full flex flex-col items-center justify-center transition-all duration-300 shadow-2xl relative z-10 disabled:opacity-40 ${
+                    micOn ? 'bg-gradient-to-tr from-rose-600 to-rose-500 text-white scale-105' : 'bg-gradient-to-tr from-saffron-500 to-amber-500 text-slate-950 shadow-glow-saffron hover:scale-105 active:scale-95'}`}
                 >
-                  {isRecording ? (
-                    <MicOff className="w-8 h-8 sm:w-9 sm:h-9" />
-                  ) : (
-                    <Mic className="w-8 h-8 sm:w-9 sm:h-9" />
-                  )}
-                  <span className="text-[9px] sm:text-[10px] font-bold mt-1 tracking-tight">
-                    {isRecording ? 'TAP TO STOP' : 'TAP & SPEAK'}
-                  </span>
+                  {micOn ? <MicOff className="w-8 h-8 sm:w-9 sm:h-9" /> : <Mic className="w-8 h-8 sm:w-9 sm:h-9" />}
+                  <span className="text-[9px] sm:text-[10px] font-bold mt-1 tracking-tight">{micOn ? 'TAP TO END' : 'TAP & TALK'}</span>
                 </button>
               </div>
-
-              {/* Dynamic Subtitle */}
-              <p className="text-xs font-semibold text-slate-200 text-center">
-                {isRecording ? (
-                  <span className="text-saffron-400 font-bold flex items-center justify-center gap-2">
-                    <span className="w-2 h-2 rounded-full bg-saffron-400 animate-ping" />
-                    Listening in real-time... Speak naturally
-                  </span>
+              <p className="text-xs font-semibold text-center min-h-[1rem]">
+                {agentSpeaking ? (
+                  <span className="text-cyan-300 flex items-center gap-2"><Volume2 className="w-4 h-4" />Agent speaking. Talk over it to interrupt.</span>
+                ) : micOn ? (
+                  <span className="text-saffron-400 flex items-center gap-2"><Ear className="w-4 h-4" />{mode === 'live' ? 'Listening continuously (hands-free)' : 'Listening (browser speech recognition)'}</span>
                 ) : (
-                  'Speak an order, payment receipt, or query in Gujarati/Hindi'
+                  <span className="text-slate-300">Tap once and keep talking. No need to hold.</span>
                 )}
               </p>
-
-              {/* Responsive Audio Waveform Visualizer */}
-              <div className="flex items-center gap-1 mt-3.5 h-8 max-w-full overflow-hidden px-2">
-                {[...Array(24)].map((_, i) => (
-                  <div
-                    key={i}
-                    className="w-1 bg-saffron-400 rounded-full transition-all duration-150 shrink-0"
-                    style={{
-                      height: isRecording 
-                        ? `${Math.max(4, Math.sin(i * 0.4 + audioLevel * 6) * 26 + 12)}px`
-                        : '4px',
-                      opacity: isRecording ? 0.9 : 0.25
-                    }}
-                  />
-                ))}
+              <div className="flex items-center gap-1 mt-3.5 h-8 px-2" aria-hidden>
+                {[...Array(24)].map((_, i) => {
+                  const lvl = micOn ? Math.min(1, micLevel * 8) : agentSpeaking ? 0.5 : 0;
+                  return <div key={i} className={`w-1 rounded-full transition-all duration-100 ${agentSpeaking ? 'bg-cyan-400' : 'bg-saffron-400'}`}
+                    style={{ height: `${Math.max(4, lvl * (12 + 16 * Math.abs(Math.sin(i * 0.7 + Date.now() / 300))))}px`, opacity: lvl ? 0.9 : 0.25 }} />;
+                })}
               </div>
-
             </div>
-
-            {/* Quick Text Input for Quiet Environments */}
             <div className="pt-4 border-t border-border flex items-center gap-2">
               <input
-                type="text"
-                value={inputUtterance}
-                onChange={(e) => setInputUtterance(e.target.value)}
+                type="text" value={inputUtterance} onChange={(e) => setInputUtterance(e.target.value)}
                 onKeyDown={(e) => e.key === 'Enter' && sendUtterance(inputUtterance)}
-                placeholder="Or type voice text: 'રાહુલને 10 કિલો ચોખા આપો'..."
-                className="flex-1 bg-background/80 border border-border rounded-xl px-3 sm:px-4 py-2.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-saffron-500 transition-colors"
+                placeholder="Too noisy? Type instead: 'રાહુલને 10 કિલો ચોખા આપો'"
+                className="flex-1 min-w-0 bg-background/80 border border-border rounded-xl px-3 sm:px-4 py-2.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-saffron-500"
               />
-              <button
-                onClick={() => sendUtterance(inputUtterance)}
-                className="px-3.5 sm:px-4 py-2.5 rounded-xl bg-saffron-500 hover:bg-saffron-600 text-slate-950 font-bold text-xs flex items-center gap-1.5 transition-colors shadow-sm shrink-0"
-              >
-                <span>Send</span>
-                <Send className="w-3.5 h-3.5" />
-              </button>
+              <button onClick={() => sendUtterance(inputUtterance)} className="px-3.5 py-2.5 rounded-xl bg-saffron-500 hover:bg-saffron-600 text-slate-950 font-bold text-xs flex items-center gap-1.5 shrink-0"><Send className="w-3.5 h-3.5" />Send</button>
             </div>
           </div>
 
-          {/* Quick Shop Scenarios (Cards) */}
-          <div className="space-y-3">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-bold uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
-                <Sparkles className="w-3.5 h-3.5 text-saffron-400" />
-                <span>Simulate Spoken Scenarios</span>
-              </span>
-              <span className="text-[11px] text-slate-500">Tap to run</span>
-            </div>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-              {scenarios.map((sc, i) => (
-                <button
-                  key={i}
-                  onClick={() => {
-                    sendUtterance(sc.text);
-                    if (window.innerWidth < 1024) setMobileTab('bill');
-                  }}
-                  className="text-left p-3 rounded-2xl bg-surface border border-border hover:border-saffron-500/40 hover:bg-card transition-all group relative overflow-hidden"
-                >
-                  <div className="flex items-center justify-between mb-1">
-                    <span className="text-[10px] font-bold text-slate-400">{sc.category}</span>
-                    <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${sc.tagColor}`}>
-                      {sc.badge}
-                    </span>
-                  </div>
-                  <p className="text-xs font-semibold text-slate-200 group-hover:text-saffron-300 line-clamp-2 transition-colors break-words">
-                    "{sc.text}"
-                  </p>
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {/* Transcript Feed */}
-          <div className="bg-surface border border-border rounded-2xl p-4 sm:p-5 shadow-sm space-y-3">
+          {/* Conversation */}
+          <div className="bg-surface border border-border rounded-2xl p-4 sm:p-5 space-y-3">
             <div className="flex items-center justify-between pb-3 border-b border-border text-xs">
-              <span className="font-bold text-white flex items-center gap-2">
-                <Volume2 className="w-4 h-4 text-saffron-400" />
-                <span>Live Dialogue History</span>
-              </span>
-              <span className="text-slate-500 text-[11px]">Real-time turns</span>
+              <span className="font-bold text-white flex items-center gap-2"><Radio className="w-4 h-4 text-saffron-400" />Live conversation</span>
+              <span className="text-slate-500 text-[11px]">Gemini transcription · real-time</span>
             </div>
-
-            <div className="max-h-56 sm:max-h-64 overflow-y-auto space-y-3 pr-1">
-              {messages.map((msg) => {
-                const isUser = msg.role === 'user';
-                const isSystem = msg.role === 'system';
-
-                if (isSystem) {
-                  return (
-                    <div key={msg.id} className="text-center py-1">
-                      <span className="inline-block px-3 py-1 rounded-full text-[10px] font-mono bg-background border border-border text-amber-300 max-w-full break-words">
-                        {msg.text}
-                      </span>
-                    </div>
-                  );
-                }
-
-                return (
-                  <div
-                    key={msg.id}
-                    className={`flex items-start gap-2.5 ${isUser ? 'flex-row-reverse' : 'flex-row'}`}
-                  >
-                    <div
-                      className={`w-6 h-6 rounded-lg flex items-center justify-center shrink-0 text-[10px] font-bold ${
-                        isUser
-                          ? 'bg-slate-700 text-slate-200'
-                          : 'bg-saffron-500/20 text-saffron-400 border border-saffron-500/40'
-                      }`}
-                    >
-                      {isUser ? 'તમે' : 'AI'}
-                    </div>
-
-                    <div
-                      className={`max-w-[85%] rounded-2xl px-3.5 py-2.5 text-xs leading-relaxed break-words ${
-                        isUser
-                          ? 'bg-saffron-500 text-slate-950 font-medium rounded-tr-none'
-                          : 'bg-card border border-border text-slate-200 rounded-tl-none'
-                      }`}
-                    >
-                      <p>{msg.text}</p>
-                      <span className={`block text-[9px] mt-1 ${isUser ? 'text-slate-900 font-semibold' : 'text-slate-500'}`}>
-                        {msg.timestamp}
-                      </span>
-                    </div>
-                  </div>
-                );
-              })}
+            <div className="max-h-72 overflow-y-auto space-y-3 pr-1">
+              {messages.length === 0 && !partial.user && !partial.agent && <p className="text-[11px] text-slate-500 text-center py-6">Waiting for the agent's greeting…</p>}
+              {messages.map((m) => <Bubble key={m.id} role={m.role} text={m.text} time={m.timestamp} />)}
+              {partial.user && <Bubble role="user" text={partial.user} time="…" ghost />}
+              {partial.agent && <Bubble role="agent" text={partial.agent} time="…" ghost />}
               <div ref={messagesEndRef} />
             </div>
           </div>
 
-        </div>
-
-        {/* RIGHT COLUMN: The Digital Counter Parchi (Bill) (5 cols) */}
-        <div className={`lg:col-span-5 space-y-6 ${mobileTab === 'mic' ? 'hidden lg:block' : 'block'}`}>
-          
-          {/* Parchi Card */}
-          <div className="parchi-paper border border-border rounded-3xl p-5 sm:p-6 shadow-card space-y-5">
-            
-            {/* Parchi Header */}
-            <div className="flex items-start justify-between pb-4 border-b border-border/80">
-              <div>
-                <div className="flex items-center gap-1.5 text-saffron-400">
-                  <Receipt className="w-4 h-4" />
-                  <span className="text-[11px] font-bold uppercase tracking-wider">કાચી પાવતી • COUNTER SLIP</span>
-                </div>
-                <h2 className="text-base font-bold text-white mt-1">Shree Ganesh Kirana</h2>
-                <p className="text-[11px] text-slate-400">Station Road, Ahmedabad</p>
-              </div>
-
-              {/* Status Seal Stamp */}
-              {draftBill?.isConfirmed ? (
-                <div className="px-3 py-1 rounded-xl bg-emerald-500/20 border border-emerald-500/40 text-emerald-400 text-xs font-bold tracking-tight rotate-3">
-                  ✓ CONFIRMED
-                </div>
-              ) : draftBill?.isPausedForApproval ? (
-                <div className="px-3 py-1 rounded-xl bg-rose-500/20 border border-rose-500/40 text-rose-400 text-xs font-bold tracking-tight -rotate-2">
-                  ⚠ APPROVAL REQ.
-                </div>
-              ) : (
-                <div className="px-2.5 py-1 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-400 text-[11px] font-semibold">
-                  ● DRAFTING
-                </div>
-              )}
+          {/* Scenarios */}
+          <div className="space-y-3">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-bold uppercase tracking-wider text-slate-400 flex items-center gap-1.5"><Sparkles className="w-3.5 h-3.5 text-saffron-400" />Try saying (or tap to send as text)</span>
             </div>
-
-            {/* Customer Details Pill */}
-            {draftBill ? (
-              <div className="p-3.5 rounded-2xl bg-background/60 border border-border space-y-1">
-                <div className="flex items-center justify-between text-xs">
-                  <span className="text-slate-400 flex items-center gap-1.5">
-                    <User className="w-3.5 h-3.5 text-saffron-400" />
-                    <span>Customer:</span>
-                  </span>
-                  <span className="font-bold text-white text-right">{draftBill.customerName}</span>
-                </div>
-                <div className="flex items-center justify-between text-xs">
-                  <span className="text-slate-400">Payment Mode:</span>
-                  <span className="font-mono text-saffron-400 font-semibold">{draftBill.paymentMode}</span>
-                </div>
-              </div>
-            ) : (
-              <div className="py-8 text-center text-slate-500 text-xs border border-dashed border-border rounded-2xl">
-                <Receipt className="w-8 h-8 text-slate-600 mx-auto mb-2" />
-                <p className="font-medium text-slate-400">No active bill</p>
-                <p className="text-[11px] text-slate-500 mt-0.5">Speak an order to populate items automatically</p>
-              </div>
-            )}
-
-            {/* Line Items Table */}
-            {draftBill && (
-              <div className="space-y-3">
-                <div className="text-[11px] font-bold uppercase tracking-wider text-slate-400">
-                  Bill Items ({draftBill.items.length})
-                </div>
-
-                <div className="divide-y divide-border/60">
-                  {draftBill.items.map((item, idx) => (
-                    <div key={idx} className="py-2.5 flex items-center justify-between text-xs">
-                      <div>
-                        <div className="font-semibold text-slate-200">{item.name}</div>
-                        <div className="text-[11px] text-slate-400">
-                          {item.quantity} {item.unit} × ₹{item.price.toFixed(2)}
-                        </div>
-                      </div>
-                      <div className="font-bold font-mono text-white text-sm">
-                        ₹{item.subtotal.toFixed(2)}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-
-                {/* Grand Total Calculation */}
-                <div className="pt-3 border-t-2 border-dashed border-border space-y-1.5">
-                  <div className="flex items-center justify-between text-xs text-slate-400">
-                    <span>Subtotal:</span>
-                    <span>₹{draftBill.totalAmount.toFixed(2)}</span>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+              {SCENARIOS.map((sc) => (
+                <button key={sc.text} onClick={() => sendUtterance(sc.text)} className="text-left p-3 rounded-2xl bg-surface border border-border hover:border-saffron-500/40 hover:bg-card transition-all group">
+                  <div className="flex items-center justify-between mb-1 gap-2">
+                    <span className="text-[10px] font-bold text-slate-400">{sc.category}</span>
+                    <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${sc.tag}`}>{sc.badge}</span>
                   </div>
-                  <div className="flex items-center justify-between text-xs text-slate-400">
-                    <span>Taxes & Delivery:</span>
-                    <span className="text-emerald-400 font-semibold">FREE (Shop Counter)</span>
-                  </div>
-                  <div className="flex items-center justify-between text-sm font-bold pt-2 border-t border-border">
-                    <span className="text-white">Total Payable (કુલ રકમ):</span>
-                    <span className="text-lg text-saffron-400 font-mono">
-                      ₹{draftBill.totalAmount.toFixed(2)}
-                    </span>
-                  </div>
-                </div>
-
-                {/* Exception Notice or Confirmation Bar */}
-                {draftBill.isPausedForApproval ? (
-                  <div className="p-3.5 rounded-2xl bg-rose-500/10 border border-rose-500/30 text-rose-300 text-xs space-y-1.5">
-                    <div className="flex items-center gap-1.5 font-bold text-rose-400">
-                      <ShieldAlert className="w-4 h-4 shrink-0" />
-                      <span>Credit Policy Exceeded</span>
-                    </div>
-                    <p className="text-[11px] leading-relaxed text-slate-300">
-                      {draftBill.approvalReason}
-                    </p>
-                    <span className="inline-block text-[10px] font-bold bg-rose-500/20 px-2 py-0.5 rounded text-rose-300">
-                      Forwarded to Approval Center
-                    </span>
-                  </div>
-                ) : draftBill.isConfirmed ? (
-                  <div className="p-3 rounded-2xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-xs flex items-center gap-2">
-                    <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0" />
-                    <div>
-                      <span className="font-bold">Transaction Successfully Recorded!</span>
-                      <p className="text-[11px] text-slate-400">Stock updated & delivery task dispatched.</p>
-                    </div>
-                  </div>
-                ) : (
-                  <div className="pt-2 flex flex-col sm:flex-row items-center gap-2">
-                    <button
-                      onClick={() => sendUtterance('હા, કન્ફર્મ કરો')}
-                      className="w-full sm:flex-1 py-3 sm:py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-600 text-slate-950 font-bold text-xs flex items-center justify-center gap-1.5 shadow-md shadow-emerald-500/20 transition-all active:scale-95"
-                    >
-                      <CheckCircle2 className="w-4 h-4" />
-                      <span>Confirm (કન્ફર્મ કરો)</span>
-                    </button>
-                    <button
-                      onClick={() => setDraftBill(null)}
-                      className="w-full sm:w-auto px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold text-xs border border-border transition-colors text-center"
-                    >
-                      Clear
-                    </button>
-                  </div>
-                )}
-
-              </div>
-            )}
-
+                  <p className="text-xs font-semibold text-slate-200 group-hover:text-saffron-300 line-clamp-2 break-words">“{sc.text}”</p>
+                </button>
+              ))}
+            </div>
           </div>
-
-          {/* Operational Guidance Card */}
-          <div className="bg-surface border border-border rounded-2xl p-4 text-xs text-slate-400 space-y-2">
-            <span className="font-bold text-slate-300 block">💡 Shopkeeper Voice Tips</span>
-            <ul className="space-y-1 text-[11px] list-disc list-inside">
-              <li>Speak naturally: <span className="text-saffron-300">"રાહુલને 10 કિલો ચોખા આપો"</span></li>
-              <li>Say <span className="text-amber-300">"Wait, change to 15 kg"</span> anytime to correct.</li>
-              <li>High credit orders automatically prompt the store owner for safety.</li>
-            </ul>
-          </div>
-
         </div>
 
+        {/* RIGHT */}
+        <div className={`lg:col-span-5 space-y-6 ${mobileTab === 'mic' ? 'hidden lg:block' : 'block'}`}>
+          <ParchiCard action={action} onSay={sendUtterance} />
+          {biCard && (
+            <div className="bg-surface border border-cyan-500/30 rounded-2xl p-4 grid grid-cols-2 gap-3 text-xs">
+              <div className="col-span-2 font-bold text-cyan-300">Today at the counter</div>
+              <Stat label="Sales" value={`₹${biCard.total_sales_today.toLocaleString('en-IN')}`} />
+              <Stat label="Orders" value={biCard.orders_count_today} />
+              <Stat label="Payments in" value={`₹${biCard.payments_received_today.toLocaleString('en-IN')}`} />
+              <Stat label="Pending approvals" value={biCard.pending_approvals_count} />
+            </div>
+          )}
+          <ActivityTimeline entries={activity} />
+        </div>
       </div>
+    </div>
+  );
+};
 
+const Stat: React.FC<{ label: string; value: React.ReactNode }> = ({ label, value }) => (
+  <div className="p-2.5 rounded-xl bg-background border border-border"><div className="text-[10px] text-slate-400">{label}</div><div className="font-mono font-bold text-white">{value}</div></div>
+);
+
+const Bubble: React.FC<{ role: VoiceMessage['role']; text: string; time: string; ghost?: boolean }> = ({ role, text, time, ghost }) => {
+  if (role === 'system') {
+    return <div className="text-center py-1"><span className="inline-block px-3 py-1 rounded-full text-[10px] font-mono bg-background border border-border text-amber-300 max-w-full break-words">{text}</span></div>;
+  }
+  const isUser = role === 'user';
+  return (
+    <div className={`flex items-start gap-2.5 ${isUser ? 'flex-row-reverse' : ''} ${ghost ? 'opacity-60' : ''}`}>
+      <div className={`w-6 h-6 rounded-lg flex items-center justify-center shrink-0 text-[10px] font-bold ${isUser ? 'bg-slate-700 text-slate-200' : 'bg-saffron-500/20 text-saffron-400 border border-saffron-500/40'}`}>{isUser ? 'તમે' : 'AI'}</div>
+      <div className={`max-w-[85%] rounded-2xl px-3.5 py-2.5 text-xs leading-relaxed break-words ${isUser ? 'bg-saffron-500 text-slate-950 font-medium rounded-tr-none' : 'bg-card border border-border text-slate-200 rounded-tl-none'}`}>
+        <p>{text}</p>
+        <span className={`block text-[9px] mt-1 ${isUser ? 'text-slate-900 font-semibold' : 'text-slate-500'}`}>{time}</span>
+      </div>
     </div>
   );
 };

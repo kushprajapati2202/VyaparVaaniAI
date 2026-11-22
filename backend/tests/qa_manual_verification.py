@@ -1,285 +1,170 @@
+"""Live end-to-end QA against a RUNNING backend with a real Gemini Live session.
+
+    python tests/qa_manual_verification.py            # backend on http://127.0.0.1:8000
+
+Typed utterances are sent over the same WebSocket the microphone uses; Gemini decides which
+tools to call. Assertions check tool calls, agent events and database state (not exact wording,
+which a generative model varies).
+"""
 import asyncio
 import json
+import sys
+import time
+
 import httpx
 import websockets
 
-BASE_URL = "http://127.0.0.1:8000/api/v1"
+BASE = "http://127.0.0.1:8000"
+API = f"{BASE}/api/v1"
 WS_URL = "ws://127.0.0.1:8000/api/v1/voice/live"
 
-async def run_full_qa():
-    report = []
-    print("="*70)
-    print("VYAPARVAANI AI — COMPREHENSIVE QA VERIFICATION SUITE")
-    print("="*70)
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        # TEST 1: Health Check
-        print("\n[TC-01] System Health & Service Ping...")
-        res = await client.get("http://127.0.0.1:8000/health")
-        assert res.status_code == 200, f"Expected 200, got {res.status_code}"
-        health_data = res.json()
-        assert health_data["status"] == "healthy"
-        print(f"  PASS: Backend healthy ({health_data['app']})")
-        report.append(("TC-01", "System Health Check", "PASS", "Status 200, Healthy"))
+class Counter:
+    """One voice-counter WebSocket session."""
 
-        # Restock inventory to baseline for clean repeatable testing
-        await client.post(f"{BASE_URL}/inventory/restock")
+    def __init__(self, ws):
+        self.ws = ws
+        self.events = []
+        self.audio_bytes = 0
 
-        # TEST 2: Customer Retrieval & Seed Verification
-        print("\n[TC-02] Customer Directory & Seed Verification...")
-        res = await client.get(f"{BASE_URL}/customers")
-        assert res.status_code == 200
-        customers = res.json()
-        assert len(customers) >= 5
-        rahul = next((c for c in customers if "Rahul" in c["name"]), None)
-        amit = next((c for c in customers if "Amit" in c["name"]), None)
-        assert rahul is not None, "Rahul Patel must exist in seed data"
-        assert amit is not None, "Amit Shah must exist in seed data"
-        print(f"  PASS: {len(customers)} customers retrieved. Verified Rahul Patel & Amit Shah.")
-        report.append(("TC-02", "Customer Directory & Seeds", "PASS", f"{len(customers)} customers verified"))
-
-        # TEST 3: Inventory Catalogue & Stock Checking
-        print("\n[TC-03] Inventory Stock & Alert Verification...")
-        res = await client.get(f"{BASE_URL}/inventory")
-        assert res.status_code == 200
-        items = res.json()
-        assert len(items) >= 6
-        rice = next((i for i in items if i["name"] == "Rice"), None)
-        assert rice is not None
-        initial_rice_stock = rice["current_stock"]
-        print(f"  PASS: {len(items)} SKUs retrieved. Current Rice Stock: {initial_rice_stock} kg.")
-        report.append(("TC-03", "Inventory Catalogue", "PASS", f"{len(items)} SKUs verified, Rice stock: {initial_rice_stock}kg"))
-
-        # TEST 4: WebSocket Voice Connection & Session Handshake
-        print("\n[TC-04] WebSocket Voice Live Gateway Connection...")
-        async with websockets.connect(WS_URL) as ws:
-            # First message should be session_started
-            session_msg = json.loads(await ws.recv())
-            assert session_msg["type"] == "session_started"
-            session_id = session_msg["session_id"]
-            print(f"  PASS: Session handshake established. Session ID: {session_id}")
-
-            # Second message should be agent welcome transcript
-            welcome_msg = json.loads(await ws.recv())
-            assert welcome_msg["type"] == "transcript"
-            assert welcome_msg["role"] == "agent"
-            print(f"  PASS: Welcome prompt received: '{welcome_msg['text'][:40]}...'")
-
-            # Receive initial audio bytes if any
+    async def wait_turn(self, timeout=45.0):
+        """Collect events until an agent turn that produced speech completes."""
+        spoke, start, collected = False, time.time(), []
+        while time.time() - start < timeout:
             try:
-                raw_audio = await asyncio.wait_for(ws.recv(), timeout=2.0)
-                if isinstance(raw_audio, bytes):
-                    print(f"  PASS: Agent speech audio synthesis delivered ({len(raw_audio)} bytes)")
+                raw = await asyncio.wait_for(self.ws.recv(), timeout=timeout)
             except asyncio.TimeoutError:
-                pass
+                break
+            if isinstance(raw, bytes):
+                self.audio_bytes += len(raw)
+                spoke = True
+                continue
+            ev = json.loads(raw)
+            self.events.append(ev)
+            collected.append(ev)
+            if ev["type"] == "audio_mp3":
+                spoke = True
+            if ev["type"] == "turn_complete" and spoke:
+                break
+        return collected
 
-            report.append(("TC-04", "WebSocket Voice Handshake", "PASS", f"Session {session_id[:8]} active, Audio streaming confirmed"))
+    async def say(self, text, timeout=45.0):
+        await self.ws.send(json.dumps({"type": "user_text", "text": text}))
+        evs = await self.wait_turn(timeout)
+        agent = " ".join(e["text"] for e in evs if e["type"] == "transcript" and e["role"] == "agent")
+        tools = [(e["tool"], e.get("error_code")) for e in evs if e["type"] == "tool_call"]
+        print(f"    USER : {text}\n    AGENT: {agent}\n    TOOLS: {tools}")
+        return evs
 
-        # TEST 5: Workflow 1 — Complete Gujarati Order Creation
-        print("\n[TC-05] Workflow 1: Complete Order Intake (Gujarati)...")
-        async with websockets.connect(WS_URL) as ws:
-            await ws.recv() # session_started
-            await ws.recv() # welcome transcript
-            try:
-                await asyncio.wait_for(ws.recv(), timeout=1.0) # welcome audio
-            except Exception:
-                pass
+    @staticmethod
+    def tools(evs, name):
+        return [e for e in evs if e["type"] == "tool_call" and e["tool"] == name]
 
-            # Send Gujarati Order Utterance
-            utterance = "રાહુલને 10 કિલો ચોખા અને 5 કિલો ખાંડ આપવાના છે. આજે ડિલિવરી રાખજો."
-            await ws.send(json.dumps({"type": "user_text", "text": utterance}))
-            
-            # Collect events
-            order_summary_received = False
-            while True:
-                msg_raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
-                if isinstance(msg_raw, str):
-                    ev = json.loads(msg_raw)
-                    if ev.get("type") == "transcript" and ev.get("role") == "agent":
-                        print(f"  Agent Spoken Read-back: '{ev['text']}'")
-                        assert "કન્ફર્મ" in ev["text"] or "ઓર્ડર" in ev["text"]
-                        order_summary_received = True
-                        break
 
-            assert order_summary_received, "Agent should read back order summary for confirmation"
+async def open_counter():
+    ws = await websockets.connect(WS_URL, max_size=None)
+    c = Counter(ws)
+    first = json.loads(await ws.recv())
+    assert first["type"] == "session_started", first
+    await c.wait_turn()  # greeting
+    return c, first
 
-            # Send Confirmation
-            print("  Sending confirmation: 'હા, કન્ફર્મ કરો'...")
-            await ws.send(json.dumps({"type": "user_text", "text": "હા, કન્ફર્મ કરો"}))
 
-            confirmed = False
-            while True:
-                msg_raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
-                if isinstance(msg_raw, str):
-                    ev = json.loads(msg_raw)
-                    if ev.get("type") == "transcript" and ev.get("role") == "agent":
-                        print(f"  Agent Confirmation Reply: '{ev['text']}'")
-                        if "સફળતાપૂર્વક" in ev["text"] or "કન્ફર્મ" in ev["text"]:
-                            confirmed = True
-                            break
+async def run():
+    results = []
 
-            assert confirmed, "Order should be confirmed successfully"
-            print("  PASS: Order confirmed via conversational voice.")
-            report.append(("TC-05", "Workflow 1: Order Intake (Gujarati)", "PASS", "Draft read-back and confirmed"))
+    def record(tc, name, ok, detail):
+        results.append((tc, name, "PASS" if ok else "FAIL", detail))
+        print(f"  {'PASS' if ok else 'FAIL'}: {detail}")
 
-        # TEST 6: Verify Database Mutation after Workflow 1
-        print("\n[TC-06] Database Mutation Verification for Workflow 1...")
-        res_orders = await client.get(f"{BASE_URL}/orders")
-        orders = res_orders.json()
-        latest_order = orders[0]
-        print(f"  Latest Order in DB: {latest_order['order_number']}, Customer: {latest_order['customer_name']}, Total: ₹{latest_order['total_amount']}")
-        assert latest_order["status"] == "CONFIRMED"
-        assert latest_order["total_amount"] == 825.0 # (10*60) + (5*45) = 600 + 225
+    async with httpx.AsyncClient(timeout=15) as http:
+        print("\n[TC-01] Health + voice status")
+        h = (await http.get(f"{BASE}/health")).json()
+        vs = (await http.get(f"{API}/voice/status")).json()
+        record("TC-01", "Health & Gemini config", h["status"] == "healthy" and vs["gemini_configured"], f"model={vs['live_model']}")
+        await http.post(f"{API}/inventory/restock")
+        rice0 = next(p for p in (await http.get(f"{API}/inventory")).json() if p["name"] == "Rice")["current_stock"]
 
-        # Check Rice Inventory Decremented
-        res_inv = await client.get(f"{BASE_URL}/inventory")
-        items = res_inv.json()
-        rice_now = next((i for i in items if i["name"] == "Rice"), None)
-        print(f"  Rice Stock Before: {initial_rice_stock} kg -> After: {rice_now['current_stock']} kg (-10 kg deducted)")
-        assert rice_now["current_stock"] == initial_rice_stock - 10.0
-        print("  PASS: Relational database mutation verified with inventory and order row persistence.")
-        report.append(("TC-06", "Database State & Stock Decrement", "PASS", f"Order {latest_order['order_number']} verified, stock decremented"))
+        print("\n[TC-02] Live session handshake + spoken greeting")
+        c, started = await open_counter()
+        record("TC-02", "Gemini Live session", started["mode"] == "live" and c.audio_bytes > 0,
+               f"mode={started['mode']} greeting_audio={c.audio_bytes}B")
 
-        # TEST 7: Workflow 2 — Mid-Sentence Barge-in Correction
-        print("\n[TC-07] Workflow 2: Mid-Sentence Barge-In Correction...")
-        async with websockets.connect(WS_URL) as ws:
-            await ws.recv() # session_started
-            await ws.recv() # welcome
-            try:
-                await asyncio.wait_for(ws.recv(), timeout=1.0)
-            except Exception:
-                pass
+        print("\n[TC-03] Gujarati order -> read-back (nothing saved yet)")
+        evs = await c.say("રાહુલભાઈને 10 કિલો ચોખા અને 5 કિલો ખાંડ આપવાના છે, ખાતામાં લખજો.")
+        prop = Counter.tools(evs, "propose_order")
+        orders_before = len((await http.get(f"{API}/orders")).json())
+        record("TC-03", "Order proposal + read-back", bool(prop) and prop[-1]["success"] and prop[-1]["result"]["total_amount"] == 825.0,
+               "propose_order total ₹825, awaiting confirmation")
 
-            # Initial instruction
-            await ws.send(json.dumps({"type": "user_text", "text": "Create an order for Rahul, 10 kg rice"}))
-            await asyncio.sleep(0.5)
+        print("\n[TC-04] Hinglish spoken correction")
+        evs = await c.say("Nahi nahi, chawal 15 kilo kar do.")
+        upd = Counter.tools(evs, "update_pending_order") or Counter.tools(evs, "propose_order")
+        record("TC-04", "Correction applied", bool(upd) and upd[-1]["result"].get("total_amount") == 15 * 60 + 5 * 45,
+               "items updated to 15 kg rice (₹1125)")
 
-            # Barge-in interruption
-            await ws.send(json.dumps({"type": "user_interruption"}))
-            int_ack = json.loads(await ws.recv())
-            # May receive transcript or interruption_acknowledged
-            print("  Interruption triggered. Output discarded.")
+        print("\n[TC-05] Confirm -> DB mutation")
+        evs = await c.say("હા, બરાબર છે, કન્ફર્મ કરો.")
+        conf = Counter.tools(evs, "confirm_action")
+        rice1 = next(p for p in (await http.get(f"{API}/inventory")).json() if p["name"] == "Rice")["current_stock"]
+        orders_after = len((await http.get(f"{API}/orders")).json())
+        record("TC-05", "Confirmed + stock decremented", bool(conf) and rice1 == rice0 - 15 and orders_after == orders_before + 1,
+               f"rice {rice0}->{rice1}")
 
-            # Send correction
-            await ws.send(json.dumps({"type": "user_text", "text": "Wait, change rice quantity to 15 kg instead!"}))
-            correction_handled = False
-            while True:
-                msg_raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
-                if isinstance(msg_raw, str):
-                    ev = json.loads(msg_raw)
-                    if ev.get("type") == "transcript" and ev.get("role") == "agent":
-                        print(f"  Agent Correction Response: '{ev['text']}'")
-                        if "15" in ev["text"]:
-                            correction_handled = True
-                            break
+        print("\n[TC-06] Ambiguous name -> clarification")
+        evs = await c.say("કિરણભાઈને 2 લીટર તેલ આપવાનું છે")
+        amb = [e for e in evs if e["type"] == "exception" and e["code"] == "MULTIPLE_MATCHES"]
+        record("TC-06", "Ambiguity detected", bool(amb), "agent asked Kiran Patel vs Kiran Desai")
+        await c.say("Rehne do, cancel karo.")
 
-            assert correction_handled, "Agent should adopt corrected 15 kg quantity"
-            print("  PASS: Mid-sentence correction successfully recognized and updated draft.")
-            report.append(("TC-07", "Workflow 2: Barge-in & Correction", "PASS", "Quantity updated to 15kg upon interruption"))
+        print("\n[TC-07] Credit breach -> owner approval -> spoken outcome")
+        evs = await c.say("Amit bhai ko 50 kilo chawal udhaar pe de do.")
+        evs += await c.say("haan, confirm")
+        appr_evt = [e for e in c.events if e["type"] == "approval_required"]
+        ok = bool(appr_evt)
+        if ok:
+            r = await http.post(f"{API}/approvals/{appr_evt[-1]['approval_id']}/resolve", json={"approved": True, "approver_notes": "Regular customer"})
+            ok = r.status_code == 200
+            evs = await c.wait_turn(45)
+            announced = any(e["type"] == "approval_resolved" for e in c.events)
+            spoken = " ".join(e["text"] for e in evs if e["type"] == "transcript" and e["role"] == "agent")
+            print(f"    AGENT: {spoken}")
+            ok = ok and announced and bool(spoken)
+        record("TC-07", "Human-in-the-loop approval", ok, "approval raised, resolved by owner, announced by voice")
 
-        # TEST 8: Workflow 4 — Credit Limit Exception & Human Approval
-        print("\n[TC-08] Workflow 4: Credit Limit Violation & Approval...")
-        async with websockets.connect(WS_URL) as ws:
-            await ws.recv() # session_started
-            await ws.recv() # welcome
-            try:
-                await asyncio.wait_for(ws.recv(), timeout=1.0)
-            except Exception:
-                pass
+        print("\n[TC-08] Payment + undo (transaction safety)")
+        cust = {x["name"]: x for x in (await http.get(f"{API}/customers")).json()}
+        bal0 = cust["Mahesh Provision Store"]["outstanding_balance"]
+        await c.say("महेश प्रोविजन स्टोर के 2000 रुपये UPI से जमा करो।")
+        await c.say("हाँ, कन्फर्म")
+        bal1 = {x["name"]: x for x in (await http.get(f"{API}/customers")).json()}["Mahesh Provision Store"]["outstanding_balance"]
+        evs = await c.say("Galti ho gayi, woh payment undo karo.")
+        if not Counter.tools(evs, "undo_last_action"):
+            evs = await c.say("haan, undo karo")
+        bal2 = {x["name"]: x for x in (await http.get(f"{API}/customers")).json()}["Mahesh Provision Store"]["outstanding_balance"]
+        record("TC-08", "Payment then undo", bal1 == bal0 - 2000 and bal2 == bal0, f"balance {bal0} -> {bal1} -> {bal2}")
 
-            # Request 50 kg rice on credit for Amit Shah (exceeds limit)
-            await ws.send(json.dumps({"type": "user_text", "text": "Give Amit 50 kg rice on credit."}))
-            
-            approval_triggered = False
-            while True:
-                msg_raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
-                if isinstance(msg_raw, str):
-                    ev = json.loads(msg_raw)
-                    if ev.get("type") == "approval_required":
-                        print(f"  Approval Event Triggered! Reason: {ev['reason']}")
-                        approval_triggered = True
-                        break
+        print("\n[TC-09] Latency + activity visibility")
+        lat = [e["ms"] for e in c.events if e["type"] == "latency"]
+        steps = [e for e in c.events if e["type"] == "workflow_step"]
+        human = [e for e in steps if e["human"]]
+        record("TC-09", "Latency & workflow events", bool(lat) and bool(steps) and bool(human),
+               f"avg latency {sum(lat) // max(1, len(lat))} ms over {len(lat)} turns, {len(steps)} steps, {len(human)} human checkpoints")
+        await c.ws.close()
+        await asyncio.sleep(1.5)
 
-            assert approval_triggered, "Credit limit violation must trigger approval event"
-            print("  PASS: Transaction safely paused; approval card queued.")
-            report.append(("TC-08", "Workflow 4: Credit Policy Violation", "PASS", "Approval triggered, action paused safely"))
+        print("\n[TC-10] Impact metrics")
+        m = (await http.get(f"{API}/bi/impact")).json()
+        record("TC-10", "ROI metrics populated", m["transactions_completed"] >= 2 and m["total_ai_cost_inr"] > 0,
+               f"txns={m['transactions_completed']} automation={m['automation_rate_percent']}% cost/txn=₹{m['cost_per_transaction_inr']}")
 
-        # TEST 9: Approval Center Resolution (Approve & Execute)
-        print("\n[TC-09] Approval Center: Approve & Execute Pending Transaction...")
-        res_appr = await client.get(f"{BASE_URL}/approvals")
-        approvals = res_appr.json()
-        assert len(approvals) > 0, "At least one pending approval should exist"
-        pending_appr = approvals[0]
-        print(f"  Resolving Approval ID: {pending_appr['id']} (Reason: {pending_appr['reason']})...")
+    print("\n" + "=" * 70)
+    for r in results:
+        print(f"{r[0]:6} {r[2]:4}  {r[1]:32} {r[3]}")
+    failed = [r for r in results if r[2] == "FAIL"]
+    print(f"\n{len(results) - len(failed)}/{len(results)} passed")
+    return 1 if failed else 0
 
-        res_resolve = await client.post(
-            f"{BASE_URL}/approvals/{pending_appr['id']}/resolve",
-            json={"approved": True, "approver_notes": "Manual QA Test - Owner Signed Off"}
-        )
-        assert res_resolve.status_code == 200
-        assert res_resolve.json()["status"] == "APPROVED"
-        print("  PASS: Approval resolved to APPROVED. Transaction executed.")
-        report.append(("TC-09", "Approval Center Resolution", "PASS", "Approved & executed by supervisor"))
-
-        # TEST 10: Workflow 3 — Payment Recording to Khata Ledger
-        print("\n[TC-10] Workflow 3: Record Payment to Customer Khata...")
-        async with websockets.connect(WS_URL) as ws:
-            await ws.recv()
-            await ws.recv()
-            try:
-                await asyncio.wait_for(ws.recv(), timeout=1.0)
-            except Exception:
-                pass
-
-            # Speak payment record
-            await ws.send(json.dumps({"type": "user_text", "text": "Rahul ka 2000 payment receive hua hai, uska ledger update kar do."}))
-            payment_recorded = False
-            while True:
-                msg_raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
-                if isinstance(msg_raw, str):
-                    ev = json.loads(msg_raw)
-                    if ev.get("type") == "transcript" and ev.get("role") == "agent":
-                        print(f"  Agent Payment Response: '{ev['text']}'")
-                        if "2,000" in ev["text"] or "2000" in ev["text"] or "જમા" in ev["text"]:
-                            payment_recorded = True
-                            break
-
-            assert payment_recorded, "Payment receipt should be recorded"
-            print("  PASS: Payment posted to customer ledger.")
-            report.append(("TC-10", "Workflow 3: Payment Record", "PASS", "₹2,000 recorded to Rahul Patel's Khata"))
-
-        # TEST 11: Workflow 5 — Conversational BI Query
-        print("\n[TC-11] Workflow 5: Conversational Business Intelligence...")
-        async with websockets.connect(WS_URL) as ws:
-            await ws.recv()
-            await ws.recv()
-            try:
-                await asyncio.wait_for(ws.recv(), timeout=1.0)
-            except Exception:
-                pass
-
-            await ws.send(json.dumps({"type": "user_text", "text": "આજનું મારું કુલ વેચાણ કેટલું થયું?"}))
-            bi_reported = False
-            while True:
-                msg_raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
-                if isinstance(msg_raw, str):
-                    ev = json.loads(msg_raw)
-                    if ev.get("type") == "bi_card":
-                        print(f"  BI Card Received: Sales ₹{ev['metrics']['total_sales_today']}, Orders: {ev['metrics']['orders_count_today']}")
-                        bi_reported = True
-                        break
-
-            assert bi_reported, "BI summary card should be returned"
-            print("  PASS: Live sales metrics calculated and spoken back.")
-            report.append(("TC-11", "Workflow 5: Conversational BI", "PASS", "Daily sales and orders accurately calculated"))
-
-    print("\n" + "="*70)
-    print("QA TEST EXECUTION SUMMARY REPORT:")
-    print("="*70)
-    for tc, name, status, detail in report:
-        print(f"  {tc.ljust(8)} | {name.ljust(35)} | {status.ljust(6)} | {detail}")
-    print("="*70)
-    print("RESULT: ALL 11 TEST CASES PASSED WITH 100% SUCCESS.")
 
 if __name__ == "__main__":
-    asyncio.run(run_full_qa())
+    sys.exit(asyncio.run(run()))

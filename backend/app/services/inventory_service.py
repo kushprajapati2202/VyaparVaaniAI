@@ -2,6 +2,7 @@ from typing import List, Optional, Tuple, Dict
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_
 from app.models.models import Product, Inventory, InventoryMovement, MovementType
+from app.agent.errors import AgentError
 
 PRODUCT_ALIASES = {
     # Rice / Chawal / Chokha
@@ -40,7 +41,23 @@ PRODUCT_ALIASES = {
     # Tea / Chai
     "ચા": "Tea",
     "chai": "Tea",
-    "tea": "Tea"
+    "tea": "Tea",
+    # Devanagari (Hindi)
+    "चावल": "Rice",
+    "चीनी": "Sugar",
+    "शक्कर": "Sugar",
+    "गेहूं": "Wheat",
+    "गेहूँ": "Wheat",
+    "आटा": "Wheat",
+    "तेल": "Cooking oil",
+    "दाल": "Toor dal",
+    "तुअर दाल": "Toor dal",
+    "चाय": "Tea",
+    # Tamil / Tanglish
+    "arisi": "Rice",
+    "sakkarai": "Sugar",
+    "ennai": "Cooking oil",
+    "paruppu": "Toor dal",
 }
 
 class InventoryService:
@@ -80,6 +97,43 @@ class InventoryService:
         # Search by name/alias
         matches = await InventoryService.search_products(db, identifier)
         return matches[0] if matches else None
+
+    @staticmethod
+    async def resolve_product(db: AsyncSession, identifier: str) -> Tuple[Product, Inventory]:
+        """Resolve a spoken product reference to one catalogue product, or raise AgentError."""
+        if not identifier or not str(identifier).strip():
+            raise AgentError(AgentError.MISSING_INFORMATION, "Product name is missing.", missing_field="product_name")
+
+        row = (await db.execute(
+            select(Product, Inventory).join(Inventory, Product.id == Inventory.product_id).where(Product.id == identifier)
+        )).first()
+        if row:
+            return row
+
+        q = str(identifier).strip().lower()
+        target = PRODUCT_ALIASES.get(q)
+        matches = await InventoryService.search_products(db, target or q)
+        if target:
+            exact = [m for m in matches if m[0].name.lower() == target.lower()]
+            if exact:
+                return exact[0]
+        exact = [m for m in matches if m[0].name.lower() == q]
+        if exact:
+            return exact[0]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise AgentError(
+                AgentError.AMBIGUOUS_PRODUCT,
+                f"'{identifier}' matches several products. Ask which one.",
+                candidates=[m[0].name for m in matches],
+            )
+        catalogue = [p.name for p in (await db.execute(select(Product))).scalars().all()]
+        raise AgentError(
+            AgentError.PRODUCT_NOT_FOUND,
+            f"'{identifier}' is not in the shop catalogue.",
+            catalogue=catalogue,
+        )
 
     @staticmethod
     async def get_all_products_with_stock(db: AsyncSession) -> List[Dict]:

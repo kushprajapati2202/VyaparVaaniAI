@@ -1,32 +1,24 @@
 import uuid
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends
-from sqlalchemy.ext.asyncio import AsyncSession
-from app.core.database import get_db, AsyncSessionLocal
-from app.services.voice_engine import VoiceSessionHandler
+from fastapi import APIRouter, WebSocket
+from app.core.database import AsyncSessionLocal
+from app.services.voice_engine import VoiceSessionHandler, gemini_configured
+from app.core.config import settings
 from app.models.models import VoiceSession, SessionStatus
 
 router = APIRouter()
+
+
+@router.get("/status")
+async def voice_status():
+    return {"gemini_configured": gemini_configured(), "live_model": settings.GEMINI_LIVE_MODEL,
+            "vertex": settings.GOOGLE_GENAI_USE_VERTEXAI}
+
 
 @router.websocket("/live")
 async def websocket_voice_live(websocket: WebSocket):
     await websocket.accept()
     session_id = str(uuid.uuid4())
-
     async with AsyncSessionLocal() as db:
-        # Create voice session record in DB
-        voice_session = VoiceSession(
-            id=session_id,
-            language="gu-IN",
-            status=SessionStatus.ACTIVE.value
-        )
-        db.add(voice_session)
+        db.add(VoiceSession(id=session_id, language="multi", status=SessionStatus.ACTIVE.value))
         await db.commit()
-
-        handler = VoiceSessionHandler(websocket=websocket, db=db, session_id=session_id)
-        try:
-            await handler.run()
-        except WebSocketDisconnect:
-            pass
-        finally:
-            voice_session.status = SessionStatus.COMPLETED.value
-            await db.commit()
+    await VoiceSessionHandler(websocket=websocket, session_id=session_id).run()

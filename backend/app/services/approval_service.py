@@ -48,6 +48,8 @@ class ApprovalService:
         approval = res.scalar_one_or_none()
         if not approval:
             raise ValueError(f"Approval request {approval_id} not found.")
+        if approval.status != ApprovalStatus.PENDING.value:
+            raise ValueError(f"Approval request is already {approval.status.lower()}.")
 
         approval.status = ApprovalStatus.APPROVED.value if approved else ApprovalStatus.REJECTED.value
         approval.approver_notes = approver_notes

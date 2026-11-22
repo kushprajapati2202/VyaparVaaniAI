@@ -28,7 +28,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ metrics, orders, inventory
               Shree Ganesh Kirana & General Store
             </h1>
             <p className="text-xs sm:text-sm text-slate-400 max-w-xl">
-              Voice-driven operations active • 95.8% transactions automated without manual typing
+              Voice-driven operations active • {metrics ? `${metrics.automation_rate_percent}% of voice transactions completed without owner intervention` : "connect to see live metrics"}
             </p>
           </div>
 
@@ -103,10 +103,10 @@ export const Dashboard: React.FC<DashboardProps> = ({ metrics, orders, inventory
             </div>
           </div>
           <div className="text-2xl sm:text-3xl font-display font-extrabold text-white tracking-tight">
-            {metrics ? metrics.automation_rate_percent : 95.8}%
+            {metrics ? metrics.automation_rate_percent : 0}%
           </div>
           <p className="text-[11px] text-saffron-400 mt-2 font-medium">
-            ~{metrics ? metrics.time_saved_hours : 4.8} hours saved today
+            ~{metrics ? metrics.time_saved_hours : 0} hours saved (measured)
           </p>
         </div>
 

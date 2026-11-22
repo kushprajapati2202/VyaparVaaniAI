@@ -38,6 +38,21 @@ SAMPLE_CUSTOMERS = [
         "address": "Near Central Bus Station, Mehsana",
         "credit_limit": 25000.0,
         "outstanding_balance": 5000.0
+    },
+    # Two customers sharing a first name -> demonstrates spoken-name disambiguation
+    {
+        "name": "Kiran Patel",
+        "phone": "9825022222",
+        "address": "8, Maninagar, Ahmedabad, Gujarat",
+        "credit_limit": 12000.0,
+        "outstanding_balance": 1500.0
+    },
+    {
+        "name": "Kiran Desai",
+        "phone": "9825011111",
+        "address": "21, Satellite Road, Ahmedabad, Gujarat",
+        "credit_limit": 8000.0,
+        "outstanding_balance": 3000.0
     }
 ]
 
@@ -165,3 +180,14 @@ async def seed_database(db: AsyncSession):
             db.add(inv)
 
         await db.commit()
+
+    else:
+        # Idempotently add any sample customers introduced after the DB was first seeded
+        existing = {c.name for c in (await db.execute(select(Customer))).scalars().all()}
+        added = False
+        for c_data in SAMPLE_CUSTOMERS:
+            if c_data["name"] not in existing:
+                db.add(Customer(org_id=org.id, **c_data))
+                added = True
+        if added:
+            await db.commit()

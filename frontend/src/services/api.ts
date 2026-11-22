@@ -1,6 +1,11 @@
-import { DailyMetrics, Order, Product, Customer, Approval } from '../types';
+import { DailyMetrics, Order, Product, Customer, Approval, ImpactMetrics } from '../types';
 
-const API_BASE = 'http://localhost:8000/api/v1';
+// Dev (vite on :5173) talks to uvicorn on :8000; in production the backend serves the SPA (same origin).
+const API_ORIGIN: string =
+  (import.meta as any).env?.VITE_API_ORIGIN ??
+  (window.location.port === '5173' ? `${window.location.protocol}//${window.location.hostname}:8000` : window.location.origin);
+const API_BASE = `${API_ORIGIN}/api/v1`;
+export const VOICE_WS_URL = `${API_ORIGIN.replace(/^http/, 'ws')}/api/v1/voice/live`;
 
 export const api = {
   async getDailyMetrics(): Promise<DailyMetrics> {
@@ -42,6 +47,12 @@ export const api = {
       body: JSON.stringify({ approved, approver_notes: approverNotes })
     });
     if (!res.ok) throw new Error('Failed to resolve approval');
+    return res.json();
+  },
+
+  async getImpact(): Promise<ImpactMetrics> {
+    const res = await fetch(`${API_BASE}/bi/impact`);
+    if (!res.ok) throw new Error('Failed to fetch impact metrics');
     return res.json();
   },
 

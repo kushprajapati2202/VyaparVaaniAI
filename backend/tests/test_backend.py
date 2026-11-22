@@ -122,4 +122,4 @@ async def test_bi_daily_metrics(test_db: AsyncSession):
     assert "total_sales_today" in metrics
     assert "low_stock_count" in metrics
     assert "automation_rate_percent" in metrics
-    assert metrics["automation_rate_percent"] > 90
+    assert 0 <= metrics["automation_rate_percent"] <= 100  # measured from voice activity, 0 when none

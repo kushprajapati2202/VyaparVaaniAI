@@ -1,276 +1,379 @@
+"""Real-time voice session: browser <-> FastAPI <-> Gemini Live (native audio-to-audio).
+
+Browser sends 16 kHz mono PCM16 frames (binary) and JSON control events.
+Gemini returns 24 kHz PCM16 audio (forwarded as binary), live transcriptions, tool calls and
+interruption signals. Tool calls are executed by AgentToolkit against the real database.
+
+If Gemini Live is unavailable (no key / connection failure) the session degrades to
+app.agent.fallback (Gemini text model or rule-based NLU + edge-tts speech).
+"""
 import asyncio
 import json
 import logging
-from typing import Optional, Dict, Any
+import time
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+
 from fastapi import WebSocket
-from sqlalchemy.ext.asyncio import AsyncSession
+from google import genai
+from google.genai import types
+from sqlalchemy.ext.asyncio import async_sessionmaker
+
+from app.agent.events import event_bus
+from app.agent.prompts import GREETING_PROMPT, SYSTEM_INSTRUCTION
+from app.agent.toolkit import AgentToolkit, TOOL_DECLARATIONS, model_view
 from app.core.config import settings
-from app.tools.tool_registry import ToolDispatcher, GEMINI_TOOLS_DECLARATIONS
-from app.models.models import VoiceSession, SessionStatus
-import edge_tts
-import io
+from app.core.database import AsyncSessionLocal
+from app.models.models import SessionStatus, VoiceSession
 
 logger = logging.getLogger("voice_engine")
 
-SYSTEM_INSTRUCTION = """
-You are VyaparVaani AI (વેપારવાણી / व्यापारवाणी), an intelligent voice-driven business operations manager for Indian MSMEs, kirana stores, and FMCG distributors.
-You converse fluently in Gujarati (ગુજરાતી), Hindi (हिन्दी), Hinglish, and Indian English.
-You are quick, courteous, professional, and accurate.
+INPUT_MIME = f"audio/pcm;rate={settings.SAMPLE_RATE}"
+CUSTOM_VOCABULARY = [
+    "khata", "udhaar", "jama", "baaki", "parchi", "kirana", "chawal", "cheeni", "khand", "gehun", "atta",
+    "tuver dal", "toor dal", "tel", "chai", "Rahul Patel", "Amit Shah", "Kiran Patel", "Kiran Desai",
+    "Mahesh Provision Store", "Neha Enterprise", "Shree Krishna Traders", "Rajeshbhai", "UPI",
+]
+MAX_RECONNECTS = 3
 
-Your Capabilities:
-1. Identify customers and vernacular product names (e.g., ચોખા/chawal=Rice, ખાંડ/cheeni=Sugar, ઘઉં/gehun=Wheat, તેલ/tel=Cooking oil).
-2. Execute tool calls to check inventory, create order drafts, post ledger payments, and report store sales.
-3. If an order violates credit policy or exceeds ₹15,000, explain that an owner approval request was created.
-4. Listen for mid-sentence corrections (e.g. "Wait, make it 15 kg instead") and immediately update the order.
-5. Always state the confirmed order number or receipt details at the end.
-"""
+
+def gemini_configured() -> bool:
+    return bool(settings.GEMINI_API_KEY) or (settings.GOOGLE_GENAI_USE_VERTEXAI and bool(settings.GOOGLE_CLOUD_PROJECT))
+
+
+def make_genai_client() -> genai.Client:
+    if settings.GOOGLE_GENAI_USE_VERTEXAI:
+        return genai.Client(vertexai=True, project=settings.GOOGLE_CLOUD_PROJECT, location=settings.GOOGLE_CLOUD_LOCATION)
+    return genai.Client(api_key=settings.GEMINI_API_KEY, http_options={"api_version": settings.GEMINI_API_VERSION})
+
 
 class VoiceSessionHandler:
-    def __init__(self, websocket: WebSocket, db: AsyncSession, session_id: str):
+    def __init__(self, websocket: WebSocket, session_id: str, session_factory: async_sessionmaker = AsyncSessionLocal, db=None):
         self.websocket = websocket
-        self.db = db
         self.session_id = session_id
-        self.language = "gu-IN"
-        self.is_interrupted = False
-        self.active_order_draft = None
+        self.session_factory = session_factory
+        self.toolkit = AgentToolkit(session_id, self.send_event, session_factory)
+        self.inbox: asyncio.Queue = asyncio.Queue()
+        self.closed = False
+        self.mode = "live"
+        self._send_lock = asyncio.Lock()
+        self.resume_handle: Optional[str] = None
+        # turn state
+        self._user_buf: List[str] = []
+        self._agent_buf: List[str] = []
+        self._last_user_activity: Optional[float] = None
+        self._awaiting_first_audio = False
+        self._agent_streaming = False   # audio of the current model turn is flowing
+        self._stale_turn = False        # user spoke during that turn -> its audio is not "the answer"
+        self._suppress_audio = False
+        self._turn_spoke = False
+        self._txn_closed = False         # a transaction was confirmed/cancelled/undone this turn
+        self._reset_context = False      # reconnect with a fresh (cheap) context at the next safe point
+        self.transcript: List[str] = []
+        self.latencies: List[float] = []
+        self.tokens: Dict[str, int] = {}
 
-    async def run(self):
-        # Notify client of connected session
-        await self.websocket.send_json({
-            "type": "session_started",
-            "session_id": self.session_id,
-            "gemini_live_model": settings.GEMINI_LIVE_MODEL,
-            "has_gemini_key": bool(settings.GEMINI_API_KEY)
-        })
+    # ------------------------------------------------------------------ browser I/O
+    async def send_event(self, event: Dict[str, Any]) -> None:
+        if self.closed:
+            return
+        try:
+            async with self._send_lock:
+                await self.websocket.send_text(json.dumps(event, default=str, ensure_ascii=False))
+        except Exception as e:
+            logger.warning("Browser send failed (%s): %r", event.get("type"), e)
+            self.closed = True
 
-        # Send welcome prompt
-        welcome_text = "નમસ્તે! હું વ્યાપારવાણી AI છું. આજે તમે કયો ઓર્ડર અથવા હિસાબ કરવા માંગો છો?"
-        await self.send_agent_response(welcome_text, "gu-IN")
+    async def send_audio(self, data: bytes) -> None:
+        if self.closed:
+            return
+        try:
+            async with self._send_lock:
+                await self.websocket.send_bytes(data)
+        except Exception as e:
+            logger.warning("Browser audio send failed: %r", e)
+            self.closed = True
 
+    async def _read_browser(self) -> None:
         try:
             while True:
                 message = await self.websocket.receive()
-                if "bytes" in message and message["bytes"]:
-                    # Binary PCM Audio received from microphone
-                    await self.handle_audio_chunk(message["bytes"])
-                elif "text" in message and message["text"]:
-                    data = json.loads(message["text"])
-                    await self.handle_json_event(data)
-        except Exception as e:
-            logger.info(f"WebSocket session closed or finished: {e}")
-
-    async def handle_json_event(self, data: Dict[str, Any]):
-        event_type = data.get("type")
-
-        if event_type == "user_interruption":
-            self.is_interrupted = True
-            logger.info("User interrupted current playback.")
-            await self.websocket.send_json({"type": "interruption_acknowledged"})
-
-        elif event_type == "set_language":
-            self.language = data.get("language", "gu-IN")
-            await self.websocket.send_json({"type": "language_changed", "language": self.language})
-
-        elif event_type == "user_text":
-            text = data.get("text", "")
-            self.is_interrupted = False
-            await self.process_user_utterance(text)
-
-    async def handle_audio_chunk(self, pcm_bytes: bytes):
-        # In full streaming mode, PCM frames pass into Gemini Live WebSocket session.
-        # Here we also support receiving recognized speech utterances or text fallback.
-        pass
-
-    async def process_user_utterance(self, text: str):
-        # 1. Echo user transcript
-        await self.websocket.send_json({
-            "type": "transcript",
-            "role": "user",
-            "text": text,
-            "is_final": True
-        })
-
-        # 2. Check for mid-sentence correction pattern
-        lower_text = text.lower()
-        if ("wait" in lower_text or "change" in lower_text or "sorry" in lower_text or "બદલો" in lower_text) and self.active_order_draft:
-            await self.websocket.send_json({
-                "type": "workflow_update",
-                "step": "PROCESSING_CORRECTION",
-                "status": "IN_PROGRESS"
-            })
-            # Parse new quantity
-            import re
-            numbers = re.findall(r'\d+', text)
-            if numbers and self.active_order_draft.get("items"):
-                new_qty = float(numbers[0])
-                # Check if specific item was named
-                target_idx = 0
-                item_name = "ચોખા"
-                if "sugar" in lower_text or "ખાંડ" in text:
-                    for idx, it in enumerate(self.active_order_draft["items"]):
-                        if "Sugar" in it.get("product_name", ""):
-                            target_idx = idx
-                            item_name = "ખાંડ"
-                            break
-                elif "wheat" in lower_text or "ઘઉં" in text:
-                    for idx, it in enumerate(self.active_order_draft["items"]):
-                        if "Wheat" in it.get("product_name", ""):
-                            target_idx = idx
-                            item_name = "ઘઉં"
-                            break
-
-                self.active_order_draft["items"][target_idx]["quantity"] = new_qty
-                correction_msg = f"સમજી ગયો. {item_name}નો જથ્થો {int(new_qty)} કિલો કરી દીધો છે. કન્ફર્મ કરું?"
-                await self.send_agent_response(correction_msg, "gu-IN")
-                return
-
-        # 3. Check for Confirmation
-        if ("confirm" in lower_text or "કન્ફર્મ" in lower_text or "હા" in lower_text or "yes" in lower_text) and self.active_order_draft:
-            await self.websocket.send_json({
-                "type": "workflow_update",
-                "step": "EXECUTING_ORDER",
-                "status": "IN_PROGRESS"
-            })
-            # Dispatch create_order_draft tool
-            res = await ToolDispatcher.dispatch("create_order_draft", self.active_order_draft, self.db, self.session_id)
-            if res.get("success"):
-                order_info = res["order"]
-                if order_info.get("requires_approval"):
-                    msg = f"ઓર્ડર {order_info['order_number']} બની ગયો છે, પણ ક્રેડિટ મર્યાદા વધારે હોવાથી એપ્રૂવલ સેન્ટરમાં મંજૂરી માટે મોકલેલ છે."
-                    await self.websocket.send_json({
-                        "type": "approval_required",
-                        "order_id": order_info["order_id"],
-                        "reason": order_info.get("approval_reason")
-                    })
-                else:
-                    msg = f"ઓર્ડર {order_info['order_number']} સફળતાપૂર્વક કન્ફર્મ થઈ ગયો છે. કુલ રકમ ₹{order_info['total_amount']:.2f} છે અને ડિલિવરી શેડ્યૂલ થઈ ગઈ છે."
-                self.active_order_draft = None
-                await self.send_agent_response(msg, "gu-IN")
-            else:
-                err_msg = f"ઓર્ડર પ્રોસેસિંગમાં ક્ષતિ: {res.get('error')}"
-                await self.send_agent_response(err_msg, "gu-IN")
-            return
-
-        # 4. Intent & Entity Extraction (Gemini / Multilingual Parser)
-        # Check for Sales/BI intent
-        if "વેચાણ" in text or "sales" in lower_text or "કુલ" in text or "kamai" in lower_text:
-            await self.websocket.send_json({"type": "workflow_update", "step": "QUERYING_BI", "status": "IN_PROGRESS"})
-            res = await ToolDispatcher.dispatch("get_daily_sales", {}, self.db, self.session_id)
-            metrics = res["metrics"]
-            speech_ans = f"આજનું કુલ વેચાણ ₹{metrics['total_sales_today']:,.2f} છે. કુલ {metrics['orders_count_today']} ઓર્ડર નોંધાયા છે."
-            await self.websocket.send_json({"type": "bi_card", "metrics": metrics})
-            await self.send_agent_response(speech_ans, "gu-IN")
-            return
-
-        # Check for Payment intent ("Rahul ka 2000 payment", "મહેશભાઈના 5000 જમા")
-        if "payment" in lower_text or "જમા" in text or "રૂપિયા" in text or "rupaye" in lower_text or "jama" in lower_text:
-            await self.websocket.send_json({"type": "workflow_update", "step": "RECORDING_PAYMENT", "status": "IN_PROGRESS"})
-            import re
-            amounts = re.findall(r'\d+', text)
-            amount = float(amounts[0]) if amounts else 2000.0
-            cust_name = "Rahul Patel" if ("rahul" in lower_text or "રાહુલ" in text) else "Mahesh Provision Store"
-            res = await ToolDispatcher.dispatch("record_payment", {"customer_name": cust_name, "amount": amount}, self.db, self.session_id)
-            if res.get("success"):
-                speech_ans = f"{res['customer_name']} ના ₹{amount:,.0f} ખાતામાં જમા થઈ ગયા છે. હવે બાકી રકમ ₹{res['updated_outstanding_balance']:,.2f} છે."
-                await self.send_agent_response(speech_ans, "gu-IN")
-            return
-
-        # Check for Order Creation (e.g. Rahul / Amit + rice / sugar / wheat)
-        if "ઓર્ડર" in text or "order" in lower_text or "ચોખા" in text or "rice" in lower_text or "sugar" in lower_text or "ખાંડ" in text or "credit" in lower_text:
-            await self.websocket.send_json({"type": "workflow_update", "step": "VALIDATING_ORDER_INTENT", "status": "IN_PROGRESS"})
-            
-            cust_name = "Rahul Patel" if ("rahul" in lower_text or "રાહુલ" in text) else "Amit Shah"
-            
-            # Detect items and quantities
-            items = []
-            if "ચોખા" in text or "rice" in lower_text:
-                items.append({"product_name": "Rice", "quantity": 50.0 if "50" in text else 10.0})
-            if "ખાંડ" in text or "sugar" in lower_text:
-                items.append({"product_name": "Sugar", "quantity": 5.0})
-            if "ઘઉં" in text or "wheat" in lower_text:
-                items.append({"product_name": "Wheat", "quantity": 20.0})
-
-            if not items:
-                items.append({"product_name": "Rice", "quantity": 10.0})
-
-            # Check stock tool execution
-            for it in items:
-                stock_res = await ToolDispatcher.dispatch("check_stock", {"product_name": it["product_name"]}, self.db, self.session_id)
-                await self.websocket.send_json({
-                    "type": "tool_executed",
-                    "tool": "check_stock",
-                    "args": {"product_name": it["product_name"]},
-                    "result": stock_res
-                })
-
-            self.active_order_draft = {
-                "customer_name": cust_name,
-                "items": items,
-                "payment_method": "CREDIT",
-                "delivery_required": True
-            }
-
-            # Check if this is Workflow 4 (Amit Shah large credit order)
-            if cust_name == "Amit Shah" and any(it["quantity"] >= 50.0 for it in items):
-                # Trigger Workflow 4: Policy violation & approval
-                res = await ToolDispatcher.dispatch("create_order_draft", self.active_order_draft, self.db, self.session_id)
-                if not res.get("success"):
-                    err_msg = f"ઓર્ડરમાં ક્ષતિ: {res.get('error')}"
-                    await self.send_agent_response(err_msg, "gu-IN")
-                    self.active_order_draft = None
-                    return
-
-                order_info = res["order"]
-                speech_ans = "અમીતભાઈની ક્રેડિટ મર્યાદા ₹10,000 છે. આ ઓર્ડરથી મર્યાદા વટાવી જાય છે. મેં મંજૂરી માટે રિક્વેસ્ટ મોકલી દીધી છે."
-                await self.websocket.send_json({
-                    "type": "approval_required",
-                    "approval_id": order_info.get("approval_id"),
-                    "order_id": order_info.get("order_id"),
-                    "reason": order_info.get("approval_reason")
-                })
-                self.active_order_draft = None
-                await self.send_agent_response(speech_ans, "gu-IN")
-                return
-
-            # Otherwise read back order draft and request confirmation
-            items_str = ", ".join([f"{it['quantity']} kg {it['product_name']}" for it in items])
-            speech_ans = f"{cust_name} માટે {items_str} નો ઓર્ડર તૈયાર છે. શું હું કન્ફર્મ કરું?"
-            await self.send_agent_response(speech_ans, "gu-IN")
-            return
-
-        # General response
-        await self.send_agent_response("મને તમારો સંદેશ મળ્યો. શું તમે નવો ઓર્ડર બનાવવા કે ખાતાવહી જોવા માંગો છો?", "gu-IN")
-
-    async def send_agent_response(self, text: str, lang: str):
-        if self.is_interrupted:
-            return
-
-        # 1. Send text transcript
-        await self.websocket.send_json({
-            "type": "transcript",
-            "role": "agent",
-            "text": text,
-            "is_final": True
-        })
-
-        # 2. Synthesize audio via edge-tts for live natural spoken response
-        try:
-            voice_map = {
-                "gu-IN": "gu-IN-DhwaniNeural",
-                "hi-IN": "hi-IN-SwaraNeural",
-                "en-IN": "en-IN-NeerjaNeural"
-            }
-            voice = voice_map.get(lang, "gu-IN-DhwaniNeural")
-            communicate = edge_tts.Communicate(text, voice)
-            audio_buffer = bytearray()
-            async for chunk in communicate.stream():
-                if self.is_interrupted:
+                if message.get("type") == "websocket.disconnect":
                     break
-                if chunk["type"] == "audio":
-                    audio_buffer.extend(chunk["data"])
-
-            if not self.is_interrupted and len(audio_buffer) > 0:
-                # Send synthesized audio binary to client
-                await self.websocket.send_bytes(bytes(audio_buffer))
+                if message.get("bytes"):
+                    await self.inbox.put(("audio", message["bytes"]))
+                elif message.get("text"):
+                    try:
+                        await self.inbox.put(("event", json.loads(message["text"])))
+                    except json.JSONDecodeError:
+                        logger.warning("Ignoring non-JSON text frame")
         except Exception as e:
-            logger.warning(f"Audio synthesis warning: {e}")
+            logger.info("Browser socket closed: %s", e)
+        finally:
+            self.closed = True
+            await self.inbox.put(None)
+
+    async def _bus_listener(self, q: asyncio.Queue) -> None:
+        while True:
+            event = await q.get()
+            if event.get("type") != "approval_resolved":
+                continue
+            action = await self.toolkit.on_approval_resolved(event)
+            await self.send_event(event)
+            if action is None and event.get("voice_session_id") != self.session_id:
+                continue  # approval belongs to another counter session
+            verdict = "APPROVED" if event.get("approved") else "REJECTED"
+            text = (f"[SYSTEM EVENT] Owner {verdict} order {event.get('order_number')} for {event.get('customer_name')} "
+                    f"(₹{(event.get('total_amount') or 0):,.0f}). Notes: {event.get('approver_notes') or 'none'}. "
+                    f"Updated khata balance: ₹{(event.get('updated_outstanding_balance') or 0):,.0f}. Tell the shopkeeper now.")
+            await self.inbox.put(("event", {"type": "system_text", "text": text}))
+
+    # ------------------------------------------------------------------ lifecycle
+    async def run(self) -> None:
+        reader = asyncio.create_task(self._read_browser())
+        bus_q = event_bus.subscribe()
+        bus_task = asyncio.create_task(self._bus_listener(bus_q))
+        status = SessionStatus.COMPLETED.value
+        try:
+            live_ok = False
+            if gemini_configured():
+                live_ok = await self._run_live()
+            if not live_ok and not self.closed:
+                from app.agent.fallback import FallbackAgent
+                self.mode = "fallback"
+                reason = "Gemini Live unavailable" if gemini_configured() else "GEMINI_API_KEY not configured"
+                await FallbackAgent(self, reason).run()
+        except Exception:
+            logger.exception("Voice session crashed")
+            status = SessionStatus.FAILED.value
+        finally:
+            self.closed = True
+            event_bus.unsubscribe(bus_q)
+            for t in (reader, bus_task):
+                t.cancel()
+            await self._persist_session(status)
+
+    def _live_config(self) -> types.LiveConnectConfig:
+        return types.LiveConnectConfig(
+            response_modalities=[types.Modality.AUDIO],
+            system_instruction=types.Content(parts=[types.Part(text=SYSTEM_INSTRUCTION)]),
+            tools=[types.Tool(function_declarations=TOOL_DECLARATIONS)],
+            input_audio_transcription=types.AudioTranscriptionConfig(custom_vocabulary=CUSTOM_VOCABULARY),
+            output_audio_transcription=types.AudioTranscriptionConfig(),
+            speech_config=types.SpeechConfig(voice_config=types.VoiceConfig(
+                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=settings.GEMINI_VOICE))),
+            realtime_input_config=types.RealtimeInputConfig(
+                automatic_activity_detection=types.AutomaticActivityDetection(
+                    disabled=False,
+                    # LOW start sensitivity: ignore background chatter / clatter at a busy counter
+                    start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW,
+                    end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_HIGH,
+                    prefix_padding_ms=settings.VAD_PREFIX_PADDING_MS,
+                    silence_duration_ms=settings.VAD_SILENCE_MS,
+                )),
+            context_window_compression=types.ContextWindowCompressionConfig(
+                trigger_tokens=settings.LIVE_CONTEXT_TRIGGER_TOKENS,
+                sliding_window=types.SlidingWindow(target_tokens=settings.LIVE_CONTEXT_TARGET_TOKENS)),
+            session_resumption=types.SessionResumptionConfig(handle=self.resume_handle),
+        )
+
+    async def _run_live(self) -> bool:
+        """Returns True if the session ran on Gemini Live until the browser left."""
+        client = make_genai_client()
+        connected_once = False
+        failures = 0
+        while not self.closed:
+            try:
+                async with client.aio.live.connect(model=settings.GEMINI_LIVE_MODEL, config=self._live_config()) as session:
+                    failures = 0
+                    if not connected_once:
+                        connected_once = True
+                        await self.send_event({"type": "session_started", "session_id": self.session_id, "mode": "live",
+                                               "model": settings.GEMINI_LIVE_MODEL, "input_rate": settings.SAMPLE_RATE,
+                                               "output_rate": 24000})
+                        await session.send_realtime_input(text=GREETING_PROMPT)
+                    elif self.resume_handle:
+                        await self.send_event({"type": "session_resumed", "resumed_with_handle": True})
+                    else:
+                        await self.send_event({"type": "context_reset"})
+                    up = asyncio.create_task(self._pump_to_gemini(session))
+                    down = asyncio.create_task(self._pump_from_gemini(session))
+                    done, pending = await asyncio.wait({up, down}, return_when=asyncio.FIRST_COMPLETED)
+                    for t in pending:
+                        t.cancel()
+                    for t in done:
+                        if not t.cancelled() and t.exception():
+                            logger.warning("Live pump ended: %r", t.exception())
+            except Exception as e:
+                failures += 1
+                logger.warning("Gemini Live connection error (%s/%s): %s", failures, MAX_RECONNECTS, e)
+                if not connected_once or failures >= MAX_RECONNECTS:
+                    await self.send_event({"type": "error", "code": "LIVE_UNAVAILABLE", "message": str(e)[:200]})
+                    return connected_once and self.closed
+                await asyncio.sleep(0.5 * failures)
+            if not self.closed:
+                logger.info("Reconnecting to Gemini Live (resumption handle: %s)", bool(self.resume_handle))
+        return True
+
+    # ------------------------------------------------------------------ upstream
+    async def _pump_to_gemini(self, session) -> None:
+        while True:
+            item = await self.inbox.get()
+            if item is None:
+                self.closed = True
+                return
+            kind, payload = item
+            if kind == "audio":
+                await session.send_realtime_input(audio=types.Blob(data=payload, mime_type=INPUT_MIME))
+                continue
+            etype = payload.get("type")
+            if etype == "user_text":
+                text = (payload.get("text") or "").strip()
+                if not text:
+                    continue
+                await self.send_event({"type": "transcript", "role": "user", "text": text, "is_final": True, "source": "typed"})
+                self.transcript.append(f"USER: {text}")
+                self._mark_user_activity()
+                await session.send_realtime_input(text=text)
+            elif etype == "system_text":
+                await session.send_realtime_input(text=payload["text"])
+            elif etype == "audio_stream_end":
+                await session.send_realtime_input(audio_stream_end=True)
+            elif etype == "user_interruption":
+                # Manual stop button: drop the rest of this agent turn locally
+                self._suppress_audio = True
+                await self.send_event({"type": "barge_in", "source": "manual"})
+            elif etype == "ping":
+                await self.send_event({"type": "pong", "ts": payload.get("ts")})
+
+    # ------------------------------------------------------------------ downstream
+    async def _pump_from_gemini(self, session) -> None:
+        while not self.closed:
+            got_any = False
+            async for msg in session.receive():
+                got_any = True
+                await self._handle_server_message(session, msg)
+                if self._reset_context:
+                    self._reset_context = False
+                    self.resume_handle = None  # reconnect WITHOUT history -> per-turn cost back to baseline
+                    return
+            if not got_any:
+                return  # connection closed by server (go_away / session limit) -> reconnect
+
+    async def _handle_server_message(self, session, msg: types.LiveServerMessage) -> None:
+        upd = msg.session_resumption_update
+        if upd and upd.resumable and upd.new_handle:
+            self.resume_handle = upd.new_handle
+        if msg.go_away:
+            logger.info("Gemini go_away: %s", msg.go_away.time_left)
+        if msg.usage_metadata:
+            self._accumulate_usage(msg.usage_metadata)
+
+        if msg.tool_call and msg.tool_call.function_calls:
+            responses = []
+            for fc in msg.tool_call.function_calls:
+                result = await self.toolkit.execute(fc.name, fc.args or {})
+                if fc.name in ("confirm_action", "cancel_action", "undo_last_action") and result.get("success"):
+                    self._txn_closed = True
+                responses.append(types.FunctionResponse(id=fc.id, name=fc.name, response={"result": model_view(result)}))
+            await session.send_tool_response(function_responses=responses)
+
+        if msg.tool_call_cancellation and msg.tool_call_cancellation.ids:
+            await self.send_event({"type": "tool_cancelled", "ids": list(msg.tool_call_cancellation.ids)})
+
+        sc = msg.server_content
+        if not sc:
+            return
+        if sc.interrupted:
+            # Native barge-in: the user started talking over the agent
+            self._flush_agent_transcript(interrupted=True)
+            self._agent_streaming = self._stale_turn = False
+            await self.send_event({"type": "barge_in", "source": "voice"})
+        if sc.input_transcription and sc.input_transcription.text:
+            self._user_buf.append(sc.input_transcription.text)
+            self._mark_user_activity()
+            await self.send_event({"type": "transcript_partial", "role": "user", "text": sc.input_transcription.text})
+        if sc.model_turn and sc.model_turn.parts:
+            for part in sc.model_turn.parts:
+                if part.inline_data and part.inline_data.data:
+                    self._agent_streaming = True
+                    self._turn_spoke = True
+                    if self._awaiting_first_audio and not self._stale_turn and self._last_user_activity is not None:
+                        self._awaiting_first_audio = False
+                        await self._flush_user_transcript()
+                        ms = round((time.perf_counter() - self._last_user_activity) * 1000)
+                        self.latencies.append(ms)
+                        await self.send_event({"type": "latency", "ms": ms})
+                        await self.toolkit.record_metric("response_latency_ms", ms)
+                    if not self._suppress_audio:
+                        await self.send_audio(part.inline_data.data)
+        if sc.output_transcription and sc.output_transcription.text:
+            self._agent_buf.append(sc.output_transcription.text)
+            await self.send_event({"type": "transcript_partial", "role": "agent", "text": sc.output_transcription.text})
+        if sc.turn_complete:
+            await self._flush_user_transcript()
+            self._flush_agent_transcript()
+            self._suppress_audio = False
+            self._agent_streaming = self._stale_turn = False
+            await self.send_event({"type": "turn_complete"})
+            if self._turn_spoke and self._txn_closed and settings.LIVE_RESET_CONTEXT_AFTER_TXN                     and self.toolkit._current_pending() is None:
+                # The outcome has been spoken; nothing is awaiting confirmation -> start the next customer fresh
+                self._txn_closed = False
+                self._reset_context = True
+            self._turn_spoke = False
+
+    def _mark_user_activity(self) -> None:
+        """Start the latency clock at the user's latest words (end of speech ~ last transcription chunk)."""
+        self._last_user_activity = time.perf_counter()
+        self._awaiting_first_audio = True
+        if self._agent_streaming:
+            self._stale_turn = True
+
+    async def _flush_user_transcript(self) -> None:
+        if self._user_buf:
+            text = "".join(self._user_buf).strip()
+            self._user_buf.clear()
+            if text:
+                self.transcript.append(f"USER: {text}")
+                await self.send_event({"type": "transcript", "role": "user", "text": text, "is_final": True, "source": "voice"})
+
+    def _flush_agent_transcript(self, interrupted: bool = False) -> None:
+        if self._agent_buf:
+            text = "".join(self._agent_buf).strip()
+            self._agent_buf.clear()
+            if text:
+                self.transcript.append(f"AGENT: {text}{' [interrupted]' if interrupted else ''}")
+                asyncio.create_task(self.send_event({"type": "transcript", "role": "agent", "text": text,
+                                                     "is_final": True, "interrupted": interrupted}))
+
+    def _accumulate_usage(self, usage: types.UsageMetadata) -> None:
+        for direction, details in (("input", usage.prompt_tokens_details), ("output", usage.response_tokens_details)):
+            for d in details or []:
+                modality = (d.modality.value if hasattr(d.modality, "value") else str(d.modality)).lower()
+                key = f"{direction}_{modality}"
+                self.tokens[key] = self.tokens.get(key, 0) + int(d.token_count or 0)
+        asyncio.create_task(self.send_event({"type": "usage", "tokens": dict(self.tokens), "cost_usd": self.cost_usd()}))
+
+    def cost_usd(self) -> float:
+        price = {
+            "input_audio": settings.LIVE_PRICE_INPUT_AUDIO_PER_M, "input_text": settings.LIVE_PRICE_INPUT_TEXT_PER_M,
+            "output_audio": settings.LIVE_PRICE_OUTPUT_AUDIO_PER_M, "output_text": settings.LIVE_PRICE_OUTPUT_TEXT_PER_M,
+        }
+        return round(sum(n * price.get(k, settings.LIVE_PRICE_INPUT_TEXT_PER_M) / 1_000_000 for k, n in self.tokens.items()), 6)
+
+    async def _persist_session(self, status: str) -> None:
+        try:
+            for k, n in self.tokens.items():
+                await self.toolkit.record_metric("tokens", n, k)
+            if self.tokens:
+                await self.toolkit.record_metric("cost_usd", self.cost_usd(), self.mode)
+            async with self.session_factory() as db:
+                vs = await db.get(VoiceSession, self.session_id)
+                if vs:
+                    vs.status = status
+                    vs.transcript = "\n".join(self.transcript)[-20000:]
+                    vs.ended_at = datetime.now(timezone.utc)
+                    vs.language = "multi"
+                    await db.commit()
+        except Exception:
+            logger.exception("Failed to persist voice session")

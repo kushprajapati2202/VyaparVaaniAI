@@ -1,4 +1,5 @@
 from typing import List, Optional
+from datetime import datetime, timezone, timedelta
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc
 from app.models.models import Customer, LedgerEntry, LedgerEntryType, Payment
@@ -89,3 +90,39 @@ class LedgerService:
         )
         res = await db.execute(stmt)
         return list(res.scalars().all())
+
+    @staticmethod
+    async def find_recent_duplicate_payment(
+        db: AsyncSession, customer_id: str, amount: float, window_seconds: int
+    ) -> Optional[Payment]:
+        since = datetime.now(timezone.utc) - timedelta(seconds=window_seconds)
+        stmt = select(Payment).where(
+            Payment.customer_id == customer_id,
+            Payment.amount == amount,
+            Payment.created_at >= since,
+        ).limit(1)
+        return (await db.execute(stmt)).scalar_one_or_none()
+
+    @staticmethod
+    async def reverse_payment(db: AsyncSession, payment_id: str, reason: str = "Recorded by mistake") -> Payment:
+        """Undo a payment: post an offsetting negative payment row and a DEBIT ledger entry."""
+        original = (await db.execute(select(Payment).where(Payment.id == payment_id))).scalar_one_or_none()
+        if not original:
+            raise ValueError(f"Payment {payment_id} not found.")
+        reversal = Payment(
+            customer_id=original.customer_id,
+            amount=-original.amount,
+            mode=original.mode,
+            payment_ref=f"REV-{original.id[:8]}",
+            notes=f"Reversal of payment {original.id[:8]}: {reason}",
+        )
+        db.add(reversal)
+        await LedgerService.record_transaction(
+            db=db,
+            customer_id=original.customer_id,
+            entry_type=LedgerEntryType.DEBIT,
+            amount=original.amount,
+            description=f"Reversal of payment ({reason})",
+            reference_id=original.id,
+        )
+        return reversal

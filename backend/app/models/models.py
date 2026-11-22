@@ -310,3 +310,14 @@ class AgentToolCall(Base):
     created_at = Column(DateTime, default=get_utc_now)
 
     session = relationship("VoiceSession", back_populates="tool_calls")
+
+class SessionMetric(Base):
+    """Generic per-session measurement (latency, tokens, language, txn duration) used for ROI analytics."""
+    __tablename__ = "session_metrics"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    session_id = Column(String(36), nullable=True, index=True)
+    metric = Column(String(64), nullable=False, index=True)
+    value = Column(Float, default=0.0)
+    label = Column(String(100), nullable=True)
+    created_at = Column(DateTime, default=get_utc_now)

@@ -85,3 +85,75 @@ export interface VoiceMessage {
     result?: any;
   };
 }
+
+// ---- Live agent events -------------------------------------------------------
+export interface AgentLineItem {
+  product_id?: string;
+  product_name: string;
+  quantity: number;
+  unit: string;
+  unit_price: number;
+  subtotal: number;
+}
+
+export type AgentActionStatus =
+  | 'AWAITING_CONFIRMATION' | 'EXECUTED' | 'PENDING_APPROVAL' | 'CANCELLED' | 'UNDONE' | 'REJECTED';
+
+export interface AgentAction {
+  action_id: string;
+  kind: 'ORDER' | 'PAYMENT';
+  status: AgentActionStatus;
+  customer_name: string;
+  warnings: string[];
+  corrections: number;
+  created_at: string;
+  items?: AgentLineItem[];
+  total_amount?: number;
+  payment_method?: string;
+  requires_approval?: boolean;
+  approval_reason?: string | null;
+  amount?: number;
+  mode?: string;
+  outstanding_before?: number;
+  projected_balance?: number;
+  result?: Record<string, any>;
+}
+
+export interface ActivityEntry {
+  id: string;
+  kind: 'step' | 'tool' | 'exception' | 'barge_in' | 'approval' | 'info';
+  title: string;
+  detail?: string;
+  status?: string;
+  human?: boolean;
+  latencyMs?: number;
+  ok?: boolean;
+  at: string;
+}
+
+export interface ImpactMetrics {
+  voice_sessions: number;
+  transactions_completed: number;
+  orders_completed: number;
+  payments_completed: number;
+  undone: number;
+  approvals_required: number;
+  automation_rate_percent: number;
+  human_touch_rate_percent: number;
+  exceptions_caught: number;
+  exceptions_by_code: Record<string, number>;
+  corrections_handled: number;
+  languages: Record<string, number>;
+  avg_response_latency_ms: number | null;
+  p90_response_latency_ms: number | null;
+  avg_tool_latency_ms: number | null;
+  avg_voice_txn_seconds: number | null;
+  manual_seconds_per_txn: number;
+  time_saved_minutes: number;
+  labour_saved_inr: number;
+  total_ai_cost_inr: number;
+  cost_per_transaction_inr: number | null;
+  subscription_price_inr: number;
+  breakeven_txns_per_month: number | null;
+  assumptions: Record<string, number | string>;
+}
