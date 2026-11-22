@@ -62,3 +62,8 @@ local_data/
 *.swo
 .DS_Store
 Thumbs.db
+
+# Owner agent (ADK) local env + deploy artefacts
+enterprise_agent/.venv/
+.deploy_state/
+enterprise_agent/*_tmp*/

@@ -5,6 +5,10 @@
 > The shopkeeper speaks in Gujarati, Hindi, Hinglish or English while serving customers. Gemini Live listens to the
 > raw audio, calls tools against the shop's real ledger, stock and order systems, reads the transaction back, executes it
 > after a spoken "haan", routes policy breaches to the owner, and confirms the outcome by voice.
+>
+> The owner, away from the shop, works with a second agent inside **Gemini Enterprise** (Google ADK on Vertex AI
+> Agent Engine). It gives the day's briefing, decides the credit orders the counter agent escalated (the decision is
+> spoken at the counter seconds later), chases udhaar and audits every voice transaction.
 
 ---
 
@@ -38,6 +42,22 @@ and the owner finds out at night. VyaparVaani turns one spoken sentence into the
   Gemini speaks the outcome (order no., new balance) ◄── 24 kHz PCM16 ── browser (gapless, flushed on barge-in)
   "undo" ─► undo_last_action ─► stock restored / reversing khata entry (within 15 min)
 ```
+### Two agents, one system of record
+```
+ SHOP COUNTER                                   OWNER (anywhere)
+ Counter agent: Gemini Live native audio        Owner agent: Google ADK on Vertex AI Agent Engine,
+ (gemini-3.8-live, Cloud Run WebSocket)         registered in Gemini Enterprise
+      │ 11 tools, propose → confirm                   │ 9 tools, preview → owner confirms
+      ▼                                               ▼
+  ┌──────────── VyaparVaani backend on Cloud Run (orders · stock · khata · approvals · audit) ────────────┐
+  │  credit breach ─► Approval ─────────────────► "Approve Amit Shah's order" (Gemini Enterprise chat)   │
+  │  counter speaks "Owner approved via Gemini Enterprise…" ◄── event bus ◄── /api/v1/enterprise/…      │
+  └──────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+The owner agent calls the token-protected `/api/v1/enterprise/*` API, and every write it makes is audited as
+`GEMINI_ENTERPRISE_AGENT`. It mirrors the counter agent's safety contract: approvals and restocks are previewed first and
+executed only after the owner explicitly confirms. Code: [`enterprise_agent/`](enterprise_agent/).
+
 Everything the agent does is streamed to the UI: tool calls with latency, workflow steps, exceptions and every
 **human checkpoint** (spoken confirmation, owner approval) on the *Agent activity* timeline, plus a live parchi (bill slip).
 
@@ -88,6 +108,7 @@ context compression, lean tool results (internal UUIDs stripped), browser noise 
 | Human-in-the-loop | spoken confirmation for every write; owner Approval Center for credit / amount policy; decision pushed back and spoken |
 | Transaction safety | nothing written before "yes"; idempotent confirm; duplicate guard; voice undo (stock + ledger reversal) |
 | Workflow visibility | Agent activity timeline, live parchi, latency & cost badges, audit log, Analytics page |
+| Gemini Enterprise | `enterprise_agent/vyaparvaani_owner/`: ADK `Agent` on Agent Engine, registered in Gemini Enterprise; briefing, approvals (announced at the counter), udhaar, restock, voice audit trail |
 | Acoustic & field resilience | browser AEC + noise suppression, echo guard, low start-of-speech sensitivity, session resumption on network drops, typed fallback, degraded mode (Gemini text / rule-based + browser STT + edge-tts) |
 
 ---
@@ -109,7 +130,7 @@ Use Chrome, allow the microphone; headphones give the cleanest barge-in (the ech
 ### Tests
 ```bash
 cd backend
-python -m pytest tests/ --ignore=tests/qa_manual_verification.py   # 23 unit/integration tests, Gemini mocked
+python -m pytest tests/ --ignore=tests/qa_manual_verification.py   # 30 unit/integration tests, Gemini mocked
 python tests/qa_manual_verification.py                             # live E2E against a running server + real Gemini Live
 ```
 
@@ -135,5 +156,8 @@ backend/app/
   api/v1/endpoints/ REST + /voice/live WebSocket
   models/           SQLAlchemy models (orders, khata ledger, approvals, workflow runs, tool calls, metrics)
 frontend/src/features/voice/   VoiceCommandCenter.tsx, audio.ts (mic worklet + PCM player), ParchiCard, ActivityTimeline
+enterprise_agent/vyaparvaani_owner/  ADK owner agent (agent.py, tools.py) for Agent Engine + Gemini Enterprise
+enterprise_agent/smoke_test.py       live multi-turn test of the owner agent against a running backend
+scripts/deploy_gcp.sh                Cloud Run + Agent Engine + Gemini Enterprise registration
 Dockerfile          Cloud Run image (React build served by FastAPI)
 ```

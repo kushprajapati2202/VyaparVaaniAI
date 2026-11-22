@@ -1,4 +1,4 @@
-from typing import List
+from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
@@ -38,6 +38,40 @@ async def list_pending_approvals(db: AsyncSession = Depends(get_db)):
         ))
     return results
 
+async def resolve_and_notify(
+    db: AsyncSession, approval_id: str, approved: bool,
+    approver_notes: Optional[str] = None, channel: str = "DASHBOARD",
+) -> Dict[str, Any]:
+    """Resolve an approval and tell the live voice session that raised it.
+
+    Shared by the dashboard and the Gemini Enterprise owner agent, so an approval given from either
+    place is announced at the shop counter the same way. Raises ValueError on unknown/already-resolved.
+    """
+    approval = await ApprovalService.resolve_approval(
+        db=db, approval_id=approval_id, approved=approved, approver_notes=approver_notes,
+    )
+    await db.commit()
+
+    order = await OrderService.get_order_by_id(db, approval.order_id) if approval.order_id else None
+    customer = (await db.execute(select(Customer).where(Customer.id == approval.customer_id))).scalar_one_or_none() if approval.customer_id else None
+    event = {
+        "type": "approval_resolved",
+        "approval_id": approval.id,
+        "approved": approved,
+        "status": approval.status,
+        "approver_notes": approver_notes,
+        "channel": channel,
+        "order_id": approval.order_id,
+        "order_number": order.order_number if order else None,
+        "total_amount": order.total_amount if order else None,
+        "customer_name": customer.name if customer else None,
+        "updated_outstanding_balance": customer.outstanding_balance if customer else None,
+        "voice_session_id": order.voice_session_id if order else None,
+    }
+    event_bus.publish(event)
+    return {**event, "resolved_at": approval.resolved_at}
+
+
 @router.post("/{approval_id}/resolve")
 async def resolve_approval(
     approval_id: str,
@@ -45,35 +79,12 @@ async def resolve_approval(
     db: AsyncSession = Depends(get_db)
 ):
     try:
-        approval = await ApprovalService.resolve_approval(
-            db=db,
-            approval_id=approval_id,
-            approved=payload.approved,
-            approver_notes=payload.approver_notes
-        )
-        await db.commit()
-
-        # Human-in-the-loop: notify the live voice session that raised this request
-        order = await OrderService.get_order_by_id(db, approval.order_id) if approval.order_id else None
-        customer = (await db.execute(select(Customer).where(Customer.id == approval.customer_id))).scalar_one_or_none() if approval.customer_id else None
-        event_bus.publish({
-            "type": "approval_resolved",
-            "approval_id": approval.id,
-            "approved": payload.approved,
-            "status": approval.status,
-            "approver_notes": payload.approver_notes,
-            "order_id": approval.order_id,
-            "order_number": order.order_number if order else None,
-            "total_amount": order.total_amount if order else None,
-            "customer_name": customer.name if customer else None,
-            "updated_outstanding_balance": customer.outstanding_balance if customer else None,
-            "voice_session_id": order.voice_session_id if order else None,
-        })
+        res = await resolve_and_notify(db, approval_id, payload.approved, payload.approver_notes)
         return {
             "success": True,
-            "approval_id": approval.id,
-            "status": approval.status,
-            "resolved_at": approval.resolved_at
+            "approval_id": res["approval_id"],
+            "status": res["status"],
+            "resolved_at": res["resolved_at"],
         }
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

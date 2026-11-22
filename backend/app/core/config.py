@@ -28,6 +28,9 @@ class Settings(BaseSettings):
     GOOGLE_GENAI_USE_VERTEXAI: bool = False
     GOOGLE_CLOUD_PROJECT: str = ""
     GOOGLE_CLOUD_LOCATION: str = "us-central1"
+    # Gemini Enterprise owner agent (ADK on Agent Engine) -> /api/v1/enterprise/*
+    # Shared bearer token; the enterprise endpoints are disabled while this is empty.
+    ENTERPRISE_AGENT_TOKEN: str = ""
     # Voice activity detection tuning (counter noise)
     VAD_SILENCE_MS: int = 500
     VAD_PREFIX_PADDING_MS: int = 300

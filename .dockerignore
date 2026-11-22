@@ -6,3 +6,6 @@
 *.db
 .env
 .git
+
+enterprise_agent/
+.deploy_state/

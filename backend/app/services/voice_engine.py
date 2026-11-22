@@ -123,7 +123,8 @@ class VoiceSessionHandler:
             if action is None and event.get("voice_session_id") != self.session_id:
                 continue  # approval belongs to another counter session
             verdict = "APPROVED" if event.get("approved") else "REJECTED"
-            text = (f"[SYSTEM EVENT] Owner {verdict} order {event.get('order_number')} for {event.get('customer_name')} "
+            via = " remotely via Gemini Enterprise" if event.get("channel") == "GEMINI_ENTERPRISE" else ""
+            text = (f"[SYSTEM EVENT] Owner{via} {verdict} order {event.get('order_number')} for {event.get('customer_name')} "
                     f"(₹{(event.get('total_amount') or 0):,.0f}). Notes: {event.get('approver_notes') or 'none'}. "
                     f"Updated khata balance: ₹{(event.get('updated_outstanding_balance') or 0):,.0f}. Tell the shopkeeper now.")
             await self.inbox.put(("event", {"type": "system_text", "text": text}))
